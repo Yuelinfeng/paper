@@ -13,7 +13,7 @@
 
 ## Abstract
 
-Expert offloading makes large Mixture-of-Experts models servable on a single GPU, but per-token latency is dominated by PCIe transfers of the top-k experts per layer. Predictive prefetching is widely believed to help, yet published results are contradictory. On a unified testbed (DeepSeek-V2-Lite, 27 layers × 64 experts, top-6) and a unified real routing trace (UltraChat, 8.29M expert requests), we answer three questions. (1) *How much is prediction accuracy worth?* An oracle meta-analysis shows a 21× miss-rate headroom from LRU to perfect prefetching, a break-even accuracy of only p*≈0.4, and that prefetching can beat Belady's demand-fetch optimum. (2) *How much lookahead does training buy?* Measuring the ahead=1..12 accuracy decay of learned per-layer MLP predictors against the training-free residual-gate predictor, we find MLP at 12 layers ahead (0.6608) matches residual-gate at 1 layer ahead (0.6664), with a 2.1× longer half-life (38.8 vs 18.1 layers). (3) *Why do gains fail to materialize?* A bandwidth-aware cache-prefetch simulator reveals that the miss-rate ranking under infinite bandwidth is *reversed* under bandwidth constraints; the effective prefetch window is set by ⌈transfer time / layer time⌉ (≈2 layers), not by the predictability profile (up to 12 layers); uniform ahead=2 is optimal across all 9 (bandwidth × capacity) combinations (+24.1% TPOT), while per-layer differentiated lookahead is a negative result. Confidence-based admission is likewise unprofitable at calibrated PCIe bandwidth (the lowest-confidence slots still carry 0.70 precision) and only pays off in the channel-saturated regime (bw=1), where fan-out=4 overtakes top-6. Our takeaway: the three levers—prediction, lookahead, admission—are priced by three different bottlenecks.
+Expert offloading makes large Mixture-of-Experts models servable on a single GPU, but per-token latency is dominated by PCIe transfers of the top-k experts per layer. Predictive prefetching is widely believed to help, yet published results are contradictory. On a unified testbed (DeepSeek-V2-Lite, 27 layers × 64 experts, top-6) and a unified real routing trace (UltraChat, 8.29M expert requests), we answer three questions. (1) *How much is prediction accuracy worth?* An oracle meta-analysis shows a 21× miss-rate headroom from LRU to perfect prefetching, a break-even accuracy of only p*≈0.4, and that prefetching can beat Belady's demand-fetch optimum. (2) *How much lookahead does training buy?* Measuring the ahead=1..12 accuracy decay of learned per-layer MLP predictors against the training-free residual-gate predictor, we find MLP at 12 layers ahead (0.6608) matches residual-gate at 1 layer ahead (0.6664), with a 2.1× longer half-life (38.8 vs 18.1 layers). (3) *Why do gains fail to materialize?* A bandwidth-aware cache-prefetch simulator reveals that the miss-rate ranking under infinite bandwidth is *reversed* under bandwidth constraints; the effective prefetch window is set by ⌈transfer time / layer time⌉ (≈2 layers), not by the predictability profile (up to 12 layers); uniform ahead=2 is optimal across all 9 (bandwidth × capacity) combinations (+24.1% TPOT), while per-layer differentiated lookahead is a negative result. Confidence-based admission is likewise unprofitable at calibrated PCIe bandwidth (the lowest-confidence slots still carry 0.70 precision) and only pays off in the channel-saturated regime (bw=1), where fan-out=4 overtakes top-6. Our takeaway: the three levers—prediction, lookahead, admission—are priced by three different bottlenecks. At calibrated PCIe bandwidth, this yields a concrete design point—per-layer MLP predictors, uniform ahead=2, full top-6 fan-out without admission control, and an LRU cache—worth a simulated +24.1% TPOT over no prefetching.
 
 ---
 
@@ -38,7 +38,7 @@ Expert offloading makes large Mixture-of-Experts models servable on a single GPU
 **贡献清单**：
 
 - **C0 复现判定**（§2.2）：ProMoE 复现成功（+14.1pp）；EAMC 复现失败并归因（请求级粗粒度信号在高多样性负载失效），为全文立下"信号粒度是命门"的前提。
-- **C-A 测量**（§2.3、§4）：准确率→miss 边际价值曲线（p*≈0.4、预取可超 Belady）；统一协议下 ahead=1..12 的预测衰减定律（首个公开的多步前瞻衰减数据，查新截至 2026-07）。
+- **C-A 测量**（§2.3、§4）：准确率→miss 边际价值曲线（p*≈0.4、预取可超 Belady）；统一协议下 ahead=1..12 的预测衰减定律（据我们所知是首个公开的多步前瞻衰减数据，查新截至 2026-07）。
 - **C-B 设施与判定**（§3.3、§5）：带宽感知专家缓存-预取模拟器（单通道 EDF 队列、按需优先、迟到/取消/浪费三分类）；排序颠倒的方法学发现；逐层差异化 ahead 调度的负结果及机制分解。
 - **C-C 付费地图**（§6）：置信度准入/动态 fan-out 的价值边界与"带宽 ÷ 预取需求"分区判据；带宽自适应 fan-out 作为饱和区唯一存活形态。
 
@@ -54,12 +54,12 @@ MoE 模型每层由路由 gate 为每个 token 从 E 个专家中选取 top-k。
 
 **MoE-Infinity EAMC（arXiv 2501.14351）复现失败**。原 claim：activation-aware 缓存（请求级 EAM 余弦匹配 + 层距衰减驱逐优先级）miss 显著低于 LRU。我们在 250-prompt 真实路由 trace（8.29M 请求、统一池、warmup 后口径）上复现，EAMC 在全部 4 个容量点均差于 LRU：
 
-| 策略                   | C=192  | C=256  | C=384  | C=512  |
-| ---------------------- | ------ | ------ | ------ | ------ |
-| LRU                    | 0.7065 | 0.6858 | 0.5506 | 0.4562 |
-| EAMC（复现版）         | 0.7776 | 0.7277 | 0.6352 | 0.5507 |
-| EAMC 无预取（eamc_np） | 0.8069 | —      | —      | —      |
-| 频率神谕               | 0.8120 | 0.7610 | 0.6659 | 0.5783 |
+| 策略 | C=192 | C=256 | C=384 | C=512 |
+|---|---|---|---|---|
+| LRU | 0.7065 | 0.6858 | 0.5506 | 0.4562 |
+| EAMC（复现版） | 0.7776 | 0.7277 | 0.6352 | 0.5507 |
+| EAMC 无预取（eamc_np） | 0.8069 | — | — | — |
+| 频率神谕 | 0.8120 | 0.7610 | 0.6659 | 0.5783 |
 | Belady（按需最优上界） | 0.4573 | 0.3887 | 0.2902 | 0.2202 |
 
 EAMC 需要多 33% 容量（C=512）才追平 LRU@384。消融（eamc_np）定位主因：**请求级粗粒度信号在高多样性负载失效**——UltraChat 首轮请求间路由模式差异大，余弦匹配到的"最近历史"与新请求实际路由相关性弱，以其为驱逐优先级等于按错误信号驱逐；而预取机制本身无害且有益（去掉预取后 miss 反而升 2.9pp）。原论文工作负载按任务聚类（约 290 类），跨请求相似性高，故信号有效。[事实（本 regime）+ 推断（机制）]
@@ -70,17 +70,17 @@ EAMC 需要多 33% 容量（C=512）才追平 LRU@384。消融（eamc_np）定�
 
 在承认"预测可能有用"之后，第一个问题是**值多少**。我们用合成预测器（每 (token, 层) 以概率 p 取真实专家、其余随机，实测 recall 与 p 误差 <0.3pp）在真实 trace 上扫描 miss(p, C)：
 
-| p                      | C=192      | C=256      | C=384      |
-| ---------------------- | ---------- | ---------- | ---------- |
-| 0（全错）              | 1.0000     | 1.0000     | 0.6370     |
-| 0.25                   | 0.7598     | 0.7568     | 0.4992     |
-| 0.5                    | 0.5195     | 0.3526     | 0.3440     |
-| 0.65                   | 0.3746     | 0.2600     | 0.2298     |
+| p | C=192 | C=256 | C=384 |
+|---|---|---|---|
+| 0（全错） | 1.0000 | 1.0000 | 0.6370 |
+| 0.25 | 0.7598 | 0.7568 | 0.4992 |
+| 0.5 | 0.5195 | 0.3526 | 0.3440 |
+| 0.65 | 0.3746 | 0.2600 | 0.2298 |
 | **0.6664（residual）** | **0.3530** | **0.2496** | **0.2198** |
-| 0.8                    | 0.1770     | 0.1647     | 0.1387     |
-| **0.8072（MLP）**      | **0.1715** | **0.1600** | **0.1347** |
-| 0.9                    | 0.0995     | 0.0990     | 0.0832     |
-| 1.0（完美）            | 0.0329     | 0.0320     | 0.0269     |
+| 0.8 | 0.1770 | 0.1647 | 0.1387 |
+| **0.8072（MLP）** | **0.1715** | **0.1600** | **0.1347** |
+| 0.9 | 0.0995 | 0.0990 | 0.0832 |
+| 1.0（完美） | 0.0329 | 0.0320 | 0.0269 |
 
 **图 1**（`figures/c8_miss_vs_p.png`）。三个结论：[事实]
 
@@ -89,6 +89,17 @@ EAMC 需要多 33% 容量（C=512）才追平 LRU@384。消融（eamc_np）定�
 - **F-A3 预取可超越按需最优**：p≥0.65 时预取 miss 已低于 Belady@192（0.3746 < 0.4573）。Belady 是按需取数最优，无法消除首次引用的强制 miss；预取把首次引用提前一层隐藏。预测驱动研究的真天花板不是 Belady，而是"layer-1 强制 miss + 窗口内驱逐损失"（本 trace 上 ≈0.027–0.033）。
 
 把真实预测器代入价格曲线：residual→MLP 的 +14.1pp 准确率兑现为 miss 0.3530→0.1715（**减半** @192）。训练成本由此获得明确的价格标签。[事实]
+
+**F-A4 合成 vs 真实预测器对照（独立误差假设的敏感性）**：上表基于独立二项误差的合成预测器；真实预测器的误差跨层/跨 token 相关。我们用真实 MLP 预测 bank（§5 的无限带宽重放）在同 recall 水平上对照：
+
+| 预测器（recall 水平） | C=192 | C=256 | C=384 |
+|---|---|---|---|
+| 合成 p=0.8072 | 0.1715 | 0.1600 | 0.1347 |
+| 真实 MLP u1（recall@1=0.8072） | **0.1410** | **0.1310** | **0.1112** |
+| 合成 p=0.8 | 0.1770 | 0.1647 | 0.1387 |
+| 真实 MLP u2（recall@2=0.7852） | **0.1979** | **0.1770** | **0.1515** |
+
+真实与合成的偏差方向不一（u1 真实**优于**合成 2.4–3.1pp；u2 真实**劣于**合成 1.2–2.1pp）、幅度 ≤3.1pp——误差结构差异（真实 top-6 概率集中、错误成簇 vs 合成均匀独立）的影响有限且双向 [事实]。故 p*≈0.4 的精确位置可能随误差相关性移动数 pp，但"入场门槛低、两个真实预测器（recall 0.66–0.81）远在线上方（余量 >26pp）"的判定不受影响；且 §5–§6 的全部主判定本就由真实 MLP bank 驱动，不依赖合成假设。[事实 + 推断（机制解释）]
 
 ### 2.4 最后一公里鸿沟
 
@@ -116,6 +127,7 @@ EAMC 需要多 33% 容量（C=512）才追平 LRU@384。消融（eamc_np）定�
 为跨越 §2.4 的鸿沟，我们构建带宽感知模拟器（`research/code/cache_sim_bw.py`，约 180 行），其设计要点：[事实]
 
 - **时间归一化**：单层计算 = 1.0 层时；带宽 bw = 每层时可传专家数，单专家传输 t_xfer = 1/bw。标定 bw≈4.5（offload TPOT≈100ms → 层时≈3.85ms；17MB @20GB/s → 0.85ms/专家）；扫描 bw ∈ {1, 2, 4, 8} 覆盖饱和到宽裕。
+- **标定自洽性**：层时 3.85ms 反推自 offload TPOT，而后者已含部分计算-传输重叠，故 bw≈4.5 应理解为"有效带宽"的近似而非物理精确值。为覆盖标定误差，扫描跨度 8 倍（bw 1→8）；全部主判定（u2 最优、u1 负收益、准入付费区的存在性）在整个扫描范围内方向一致，不依赖 bw 的精确定值 [事实]。
 - **传输模型**：单通道、非抢占、work-conserving；预取按 EDF（deadline = 目标层开始时刻）排队；**按需请求最高优先**——等在传项完成 + 插队队首，可截胡取消排队中的同专家预取。
 - **缓存**：统一 LRU 池，容量 C ∈ {192, 256, 384}（192 为仓库实验常用值，156=26×6 为理论最小工作集）；预取在完成时刻准入。
 - **预取卫生指标**：admit（完成准入）/ used（被命中）/ wasted（驱逐未用 + 流末滞留）/ late（目标层已开始才完成）/ cancelled（被按需截胡）三分类，暴露每一种浪费。
@@ -132,17 +144,17 @@ EAMC 需要多 33% 容量（C=512）才追平 LRU@384。消融（eamc_np）定�
 
 ### 4.1 主结果：总体 recall@6 衰减曲线
 
-| ahead | MLP        | residual | freq   | MLP−residual |
-| ----- | ---------- | -------- | ------ | ------------ |
-| 1     | 0.8072     | 0.6664   | 0.1467 | +14.1pp      |
-| 2     | 0.7852     | 0.6422   | 0.1475 | +14.3pp      |
-| 3     | 0.7666     | 0.6132   | 0.1484 | +15.3pp      |
-| 4     | 0.7494     | 0.5852   | 0.1484 | +16.4pp      |
-| 5     | 0.7357     | 0.5631   | 0.1492 | +17.3pp      |
-| 6     | 0.7220     | 0.5406   | 0.1494 | +18.1pp      |
-| 8     | 0.6996     | 0.5025   | 0.1484 | +19.7pp      |
-| 10    | 0.6787     | 0.4687   | 0.1485 | +21.0pp      |
-| 12    | **0.6608** | 0.4389   | 0.1487 | **+22.2pp**  |
+| ahead | MLP | residual | freq | MLP−residual |
+|---|---|---|---|---|
+| 1 | 0.8072 | 0.6664 | 0.1467 | +14.1pp |
+| 2 | 0.7852 | 0.6422 | 0.1475 | +14.3pp |
+| 3 | 0.7666 | 0.6132 | 0.1484 | +15.3pp |
+| 4 | 0.7494 | 0.5852 | 0.1484 | +16.4pp |
+| 5 | 0.7357 | 0.5631 | 0.1492 | +17.3pp |
+| 6 | 0.7220 | 0.5406 | 0.1494 | +18.1pp |
+| 8 | 0.6996 | 0.5025 | 0.1484 | +19.7pp |
+| 10 | 0.6787 | 0.4687 | 0.1485 | +21.0pp |
+| 12 | **0.6608** | 0.4389 | 0.1487 | **+22.2pp** |
 
 weighted recall（按 gate 概率加权）：MLP 0.8777(a=1)→0.7523(a=12)；residual 0.7569→0.5210。**图 2**（`figures/c1_decay_curves.png`）。[事实]
 
@@ -150,11 +162,11 @@ weighted recall（按 gate 概率加权）：MLP 0.8777(a=1)→0.7523(a=12)；re
 
 ### 4.2 衰减定律拟合
 
-| 预测器   | 线性 r₀ − k·a     | 线性 R² | 指数半衰期  | 指数 R² |
-| -------- | ----------------- | ------- | ----------- | ------- |
-| MLP      | 0.808 − 1.30pp/层 | 0.978   | **38.8 层** | 0.985   |
-| residual | 0.676 − 2.08pp/层 | 0.987   | **18.1 层** | 0.997   |
-| freq     | ≈0.148（无趋势）  | 0.30    | —           | —       |
+| 预测器 | 线性 r₀ − k·a | 线性 R² | 指数半衰期 | 指数 R² |
+|---|---|---|---|---|
+| MLP | 0.808 − 1.30pp/层 | 0.978 | **38.8 层** | 0.985 |
+| residual | 0.676 − 2.08pp/层 | 0.987 | **18.1 层** | 0.997 |
+| freq | ≈0.148（无趋势） | 0.30 | — | — |
 
 residual 衰减更接近指数律（R²=0.997）；MLP 两种拟合均优。**MLP 半衰期为 residual 的 2.1 倍**——学习型预测器的优势随时距放大。[事实]
 
@@ -176,14 +188,14 @@ residual 衰减更接近指数律（R²=0.997）；MLP 两种拟合均优。**ML
 
 先在零传输成本假设下（预取瞬时完成、不占带宽）跑 miss 对比：
 
-| schedule                | C=192      | C=256      | C=384      |
-| ----------------------- | ---------- | ---------- | ---------- |
-| u1（统一 ahead=1）      | **0.1410** | **0.1310** | **0.1112** |
-| u2                      | 0.1979     | 0.1770     | 0.1515     |
-| u3                      | 0.2420     | 0.2107     | 0.1805     |
-| u6                      | 0.3558     | 0.2986     | 0.2557     |
-| pl0.6（逐层 a*，τ=0.6） | 0.3060     | 0.2311     | 0.2013     |
-| pl0.7（τ=0.7）          | 0.2537     | 0.1971     | 0.1705     |
+| schedule | C=192 | C=256 | C=384 |
+|---|---|---|---|
+| u1（统一 ahead=1） | **0.1410** | **0.1310** | **0.1112** |
+| u2 | 0.1979 | 0.1770 | 0.1515 |
+| u3 | 0.2420 | 0.2107 | 0.1805 |
+| u6 | 0.3558 | 0.2986 | 0.2557 |
+| pl0.6（逐层 a*，τ=0.6） | 0.3060 | 0.2311 | 0.2013 |
+| pl0.7（τ=0.7） | 0.2537 | 0.1971 | 0.1705 |
 
 零传输成本下窗口无价值、污染全是代价，故窗口最小的 u1 全胜。这是大量离线预取研究止步的对比——**而它是误导的**。[事实]
 
@@ -191,15 +203,15 @@ residual 衰减更接近指数律（R²=0.997）；MLP 两种拟合均优。**ML
 
 接入 §3.3 模拟器（bw ∈ {2,4,8}，C=256；其余容量结论一致）：
 
-| schedule       | bw=2      | bw=4      | bw=8      | 改善 @bw4 vs none   |
-| -------------- | --------- | --------- | --------- | ------------------- |
-| none（不预取） | 79.49     | 52.75     | 39.37     | —                   |
-| u1             | 84.66     | 55.32     | 40.66     | **−4.9%（负收益）** |
-| **u2**         | **67.44** | **40.03** | **32.12** | **+24.1%**          |
-| u3             | 68.44     | 41.28     | 33.25     | +21.7%              |
-| u6             | 72.44     | 46.16     | 36.01     | +12.5%              |
-| pl0.6          | 73.00     | 42.98     | 33.27     | +18.5%              |
-| pl0.7          | 71.19     | 41.28     | 32.31     | +21.7%              |
+| schedule | bw=2 | bw=4 | bw=8 | 改善 @bw4 vs none |
+|---|---|---|---|---|
+| none（不预取） | 79.49 | 52.75 | 39.37 | — |
+| u1 | 84.66 | 55.32 | 40.66 | **−4.9%（负收益）** |
+| **u2** | **67.44** | **40.03** | **32.12** | **+24.1%** |
+| u3 | 68.44 | 41.28 | 33.25 | +21.7% |
+| u6 | 72.44 | 46.16 | 36.01 | +12.5% |
+| pl0.6 | 73.00 | 42.98 | 33.27 | +18.5% |
+| pl0.7 | 71.19 | 41.28 | 32.31 | +21.7% |
 
 **图 4**（`figures/c9_tpot_vs_bw.png`）。**u2 在全部 9 个（带宽 × 容量）组合下 TPOT 最优**；bw=4、C=256 时 u2 的 miss=0.217，已低于 Belady 按需上界 0.3887（预取隐藏强制 miss，同 §2.3 F-A3）。**排序颠倒**：无限带宽的最优（u1）在带宽受限下是全场唯一负收益；无限带宽下平平的 u2 成为全胜者。零传输成本假设下的离线 miss 对比，结论可能反号——这是本文的方法学警示。[事实]
 
@@ -219,10 +231,10 @@ residual 衰减更接近指数律（R²=0.997）；MLP 两种拟合均优。**ML
 
 MLP（ahead=2，甜点配置）输出逐槽位 softmax 概率作为置信度。信号有效：conf 与命中强相关，**AUROC=0.728**（>0.7 门槛）：
 
-| conf 桶   | <0.05 | 0.05–0.1 | 0.1–0.2 | 0.3–0.5 | ≥0.9      |
-| --------- | ----- | -------- | ------- | ------- | --------- |
-| 占比      | 69%   | 6%       | 5%      | 4%      | 8%        |
-| precision | 0.696 | 0.864    | 0.918   | 0.971   | **0.999** |
+| conf 桶 | <0.05 | 0.05–0.1 | 0.1–0.2 | 0.3–0.5 | ≥0.9 |
+|---|---|---|---|---|---|
+| 占比 | 69% | 6% | 5% | 4% | 8% |
+| precision | 0.696 | 0.864 | 0.918 | 0.971 | **0.999** |
 
 关键背景：64 路 softmax 下 conf<0.05（≈3× 均匀值 1/64）的槽位 precision 仍达 **0.70**——最低置信区依然"多半是对的"。这是后续所有准入策略失效的算术根源。[事实]
 
@@ -230,20 +242,20 @@ MLP（ahead=2，甜点配置）输出逐槽位 softmax 概率作为置信度。�
 
 构造三族准入策略（对预测 bank 离线过滤后重放）：固定 fan-out 截断 u2k{1,2,3,4}；槽位概率门槛 u2p{0.05,0.5}；组级概率质量门控 u2m{0.7,0.95}。TPOT（C=256，括号为相对 u2 的增量，负=更优）：
 
-| policy                 | fan-out | bw=2          | bw=4          | bw=8          |
-| ---------------------- | ------- | ------------- | ------------- | ------------- |
-| none                   | —       | 79.49         | 52.75         | 39.37         |
-| **u2（top-6 全准入）** | 6.00    | **67.44**     | **40.03**     | **32.12**     |
-| u2k1/k2/k3             | 1–3     | ≈none（±0.7） | ≈none         | ≈none         |
-| u2k4                   | 4.00    | 70.33 (+2.89) | 47.83 (+7.80) | 36.91 (+4.79) |
-| u2p0.05                | 1.93    | 79.08 (+11.6) | 52.51 (+12.5) | 39.26 (+7.1)  |
-| u2p0.5                 | 0.90    | 79.52 (+12.1) | 52.76 (+12.7) | 39.38 (+7.3)  |
-| u2m0.7                 | 6.00    | 67.63 (+0.19) | 40.17 (+0.14) | 32.21 (+0.08) |
-| u2m0.95                | 5.86    | 68.12 (+0.68) | 40.69 (+0.66) | 32.48 (+0.36) |
+| policy | fan-out | bw=2 | bw=4 | bw=8 |
+|---|---|---|---|---|
+| none | — | 79.49 | 52.75 | 39.37 |
+| **u2（top-6 全准入）** | 6.00 | **67.44** | **40.03** | **32.12** |
+| u2k1/k2/k3 | 1–3 | ≈none（±0.7） | ≈none | ≈none |
+| u2k4 | 4.00 | 70.33 (+2.89) | 47.83 (+7.80) | 36.91 (+4.79) |
+| u2p0.05 | 1.93 | 79.08 (+11.6) | 52.51 (+12.5) | 39.26 (+7.1) |
+| u2p0.5 | 0.90 | 79.52 (+12.1) | 52.76 (+12.7) | 39.38 (+7.3) |
+| u2m0.7 | 6.00 | 67.63 (+0.19) | 40.17 (+0.14) | 32.21 (+0.08) |
+| u2m0.95 | 5.86 | 68.12 (+0.68) | 40.69 (+0.66) | 32.48 (+0.36) |
 
 C=192/384 同构。**u2 全胜；pmass 门控（u2m*）最接近但严格更差**。三条机制：[事实]
 
-- **准入失效的算术**：拒绝一个 conf=0.04 槽位，省 17MB 传输（通道空闲时价值≈0），损失 0.70 命中概率 × 按需停顿（≈0.3 层时）——期望亏损 ≫ 节省。**最低置信区 precision 仍 0.70，准入控制无可切之肉**。
+- **准入失效的算术**：拒绝一个 conf=0.04 槽位，省 17MB 传输（通道空闲时价值≈0）与 1/C 缓存容量（驱逐 LRU 尾部的期望代价，尾部价值低），损失 0.70 命中概率 × 按需停顿（≈0.3 层时）——期望亏损 ≫ 节省。端到端 TPOT 已计入容量污染效应，u2 全胜是含该效应的结果。**最低置信区 precision 仍 0.70，准入控制无可切之肉**。
 - **fan-out 悬崖**：k≤3 时预取收益精确归零（TPOT≈none）——top-k 的边际价值集中在第 4–6 槽，截断即失血。这与仓库实机"top2≈baseline、top6 恶化"看似矛盾：实机 top6 恶化源于混池污染而非带宽，干净 LRU 池没有该效应。[推断]
 - **粒度结论**：概率准入把 fan-out 摊薄到所有层（每层 1–2 个），效果≈降 fan-out；准入的正确粒度是"每层的 top-k 截断"而非"全局概率门槛"。
 
@@ -251,19 +263,21 @@ C=192/384 同构。**u2 全胜；pmass 门控（u2m*）最接近但严格更差*
 
 把带宽压到 bw=1（极端稀缺，C=256）：
 
-| policy   | TPOT       | vs none   | vs u2             |
-| -------- | ---------- | --------- | ----------------- |
-| none     | 132.98     | —         | —                 |
-| u2       | 128.56     | +3.3%     | —                 |
+| policy | TPOT | vs none | vs u2 |
+|---|---|---|---|
+| none | 132.98 | — | — |
+| u2 | 128.56 | +3.3% | — |
 | **u2k4** | **122.75** | **+7.7%** | **−5.81（反超）** |
-| u2p0.05  | 132.60     | +0.3%     | +4.04             |
-| u2m0.7   | 128.90     | +3.1%     | +0.34             |
+| u2p0.05 | 132.60 | +0.3% | +4.04 |
+| u2m0.7 | 128.90 | +3.1% | +0.34 |
 
 bw=1 时 u2 的迟到率高达 89%（270 万/302 万 admits）——通道饱和后 top-6 的低价值槽位（第 5、6 名）挤占高价值槽位的传输，k=4 截断反而净赚。**交叉点存在：fan-out 应随带宽自适应**。**图 5**（`figures/c4_fanout_tpot.png`）。[事实]
 
 ### 6.4 本节判定：准入付费地图
 
-预取需求 ≈3.4 次传输/层时（u2 top-6、命中率与命中时延折算），故 **bw < 需求 ⇒ 通道饱和 ⇒ 准入/fan-out 截断付费；bw ≥ 需求 ⇒ 全准入最优**。分区判据给出付费地图：PCIe offload（bw≈4.5）在区外——置信度准入与动态 fan-out 在标定区是负结果；共享总线、多实例争抢、CXL 远端内存等场景在区内，带宽自适应 fan-out（最优 k* ≈ bw × 窗口 / 需求）是唯一存活形态，收益量级 4.5~7.7%。[事实（本扫描）+ 推断（外推）]
+**预取需求的推导**（u2 top-6，模拟实测）：每层每 token 发出预取 5.5 个（6 个 × 有效层比例 24/26，末 2 层无目标层），窗口 2 层时 → 预取流量 = 5.5/2 ≈ **2.75 次传输/层时**；按需净增流量（miss 且未被在传预取覆盖的新传输）≈0.4–0.8 次/层时。合计 **≈3.2–3.5 次/层时**。佐证：bw=4 时仅预取完成传输（476 万次 × 0.25 层时）已占通道总历时的 88%，通道逼近满载而队列未爆（late 仅 2%）——供给 4.0 刚好高于需求 ≈3.3。[事实]
+
+**付费区判据（精确化）**：通道饱和（供给 < 需求）是截断付费的**必要而非充分**条件。bw=2 已轻度饱和（供给/需求 ≈0.6），但 u2k4 仍不付费（70.33 vs 67.44：命中损失 > 排队节省）；bw=1 深度饱和（供给/需求 ≈0.3，迟到率 89%）时才出现交叉。**付费区 = 深度饱和区，交叉点位于 bw∈(1,2)，即供给/需求 ≈0.3–0.6 之间**。付费地图：PCIe offload（4.5/3.3 ≈ 1.4）远在区外——置信度准入与动态 fan-out 在标定区是负结果；共享总线、多实例争抢、CXL 远端内存等供给/需求 ≲0.5 的场景在区内，带宽自适应 fan-out（k* ≈ bw × 窗口 / 每token需求数）是唯一存活形态，观测收益 4.5~7.7%。[事实（本扫描）+ 推断（外推）]
 
 ---
 
@@ -275,11 +289,11 @@ bw=1 时 u2 的迟到率高达 89%（270 万/302 万 admits）——通道饱和
 
 ### 7.2 三杠杆定价框架（全文 take-away）
 
-| 杠杆                     | 定价瓶颈      | 本文结论                                                     | 证据     |
-| ------------------------ | ------------- | ------------------------------------------------------------ | -------- |
+| 杠杆 | 定价瓶颈 | 本文结论 | 证据 |
+|---|---|---|---|
 | 预测（训练 vs 训练自由） | miss 价值曲线 | 入场线 p*≈0.4 远低于两者水平；训练买 11 层提前量，半衰期 2.1× | §2.3、§4 |
-| 提前量（统一/逐层）      | 带宽 ÷ 层时   | a*=⌈t_xfer/t_layer⌉≈2 封顶；逐层差异化无增益                 | §5       |
-| 准入（置信度/fan-out）   | 通道饱和度    | 标定带宽无可切之肉；饱和区带宽自适应 fan-out 付费（+7.7%）   | §6       |
+| 提前量（统一/逐层） | 带宽 ÷ 层时 | a*=⌈t_xfer/t_layer⌉≈2 封顶；逐层差异化无增益 | §5 |
+| 准入（置信度/fan-out） | 通道饱和度 | 标定带宽无可切之肉；饱和区带宽自适应 fan-out 付费（+7.7%） | §6 |
 
 三个杠杆各自由不同瓶颈定价——这是本文的核心信息。它解释了文献结论矛盾的根源：不同工作在价值曲线的不同段落、不同带宽 regime 下各自切片。[事实]
 
@@ -301,7 +315,7 @@ bw=1 时 u2 的迟到率高达 89%（270 万/302 万 admits）——通道饱和
 
 ## 8. 相关工作
 
-**训练自由路由预测**：Speculating Experts、ST-MoE 跨层共现统计、ExpertFlow 等均只做 ahead=1（next-layer）预测；ExpertFlow 提到"步长扩大→准确率下降"但无公开数据。本文给出首个统一协议下 ahead=1..12 的完整衰减曲线（查新截至 2026-07）。[事实]
+**训练自由路由预测**：Speculating Experts、ST-MoE 跨层共现统计、ExpertFlow 等均只做 ahead=1（next-layer）预测；ExpertFlow 提到"步长扩大→准确率下降"但无公开数据。据我们所知，本文给出首个统一协议下 ahead=1..12 的完整衰减曲线（查新截至 2026-07）。[事实]
 
 **学习型路由预测**：ProMoE（本文复现锚点）证明 MLP 显著优于 skip-based 单步预测；DuoServe 的 ExpertMLP 为黑盒学习式预测。两者均未测多步前瞻衰减，也未与带宽耦合分析。[事实]
 
@@ -315,8 +329,9 @@ bw=1 时 u2 的迟到率高达 89%（270 万/302 万 admits）——通道饱和
 
 - **单模型、单数据 regime、离线模拟口径**：全部结论在 DS-V2-Lite + UltraChat 首轮上获得；第二模型（Qwen3-30B-A3B）与第二数据集（ShareGPT）复核进行中；实机端到端 TPOT 兑现未测（§7.3 的差值待收复）。[事实]
 - **归一化时间模型**：恒定层时、单通道、非抢占 EDF；未建模多通道并发、NVLink、计算-传输细粒度重叠；真实系统带宽抖动会推宽饱和区边界。[假设]
-- **合成预测器误差独立假设**（§2.3）：真实预测器误差跨层/跨 token 相关，污染模式可能更坏或更好；§5–§6 已用真实 MLP 预测复跑主结论（u2 判定与准入判定均成立），但该假设仍影响 §2.3 曲线的精细形状。[推断]
-- **口径差异**：MLP 评估集 50 prompts vs residual 250 prompts（已校验不影响结论方向）；a>12 的外推基于拟合曲线未实测。[事实]
+- **合成预测器误差独立假设**（§2.3）：真实预测器误差跨层/跨 token 相关；§2.3 F-A4 的对照显示同 recall 水平真实 vs 合成偏差 ≤3.1pp 且方向双向，p* 的精确位置可能移动数 pp，但不影响"入场门槛低"的判定；§5–§6 主判定全部由真实 MLP bank 驱动。[事实]
+- **口径差异（已量化）**：MLP 评估集 50 prompts vs residual 250 prompts。补测 residual 在同一 50-prompt 测试集上的 recall（`predictor_repro_residual_test50.json`）：ahead=1/4/12 分别为 0.6657/0.5827/0.4369，与 250-prompt 口径（0.6664/0.5852/0.4389）相差 ≤0.25pp，全部 9 个 ahead 最大偏差 0.31pp——口径差异不改变两预测器差距与衰减斜率。[事实]
+- **统计稳健性**：TPOT/miss 数字来自单一 trace 的单次完整回放，未报 prompt 子集 bootstrap 区间；token 级样本量大（8.29M 请求）但 prompt 级（250 条）外推受 regime 限制，故所有结论按"本 regime 内成立"表述。[事实]
 - **扫描覆盖**：置信度准入仅扫 ahead=2；概率门槛网格未覆盖 fan-out≈4 的细档（θ≈0.02）；τ 仅 {0.6, 0.7} 两档。[事实]
 
 ## 10. 结论
@@ -349,4 +364,17 @@ bw=1 时 u2 的迟到率高达 89%（270 万/302 万 admits）——通道饱和
 - **G2**：Qwen3-30B-A3B 复核衰减定律；ShareGPT 第二数据集交叉验证。
 - **G3**：CCT 融合预测器作为 §4 消融行。
 - **G4（可选）**：长上下文（4k–32k）路由漂移测绘；抢占式传输调度。
-- **G5**：英译、图表统一重绘、Related Work 扩段、参考文献补全。
+- **G5**：英译、图表统一重绘、Related Work 扩段（补 CPU 预取 accuracy/coverage/timeliness 与 OS 页面预取的方法论迁移）、参考文献补全。
+
+### 审稿回应修复记录（2026-07-25，v1→v1.1）
+
+- **W4（合成误差假设）**：§2.3 新增 F-A4 合成 vs 真实对照表（既有数据，无新实验）——同 recall 水平偏差 ≤3.1pp 且双向，p* 判定稳健；§9 对应条目同步改写。
+- **M5（口径差异量化）**：`predictor_repro.py` 新增 `--residual-on-test` 开关，补测 residual@test50 全 ahead（`predictor_repro_residual_test50.json`）——与 @250 口径最大偏差 0.31pp，已写入 §9。
+- **W5**：英文 Abstract 补设计点结论句（+24.1% TPOT）。
+- **M3**：两处"首个"改为"据我们所知，首个"。
+- **3.4 推导（自查补强）**：§6.4 新增预取需求显式推导（5.5 预取/层访 ÷ 2 层窗口 ≈2.75 + 按需净增 ≈0.4–0.8 ≈ 3.2–3.5 次/层时；bw=4 通道忙时 88% 佐证），并把付费区判据精确化为"深度饱和（供给/需求 ≈0.3–0.6）"——bw=2 轻度饱和但截断不付费的原表述已修正。
+- **bw 标定自洽性（自查补强）**：§3.3 新增说明——bw≈4.5 为有效带宽近似，8 倍扫描范围内主判定方向一致。
+- **F1 算术补容量维度（自查补强）**：§6.2 准入失效算术补"1/C 容量代价 + 端到端 TPOT 已含污染效应"。
+- **统计稳健性（自查补述）**：§9 新增"单一 trace 单次回放、无 prompt 子集方差"条目。
+- **代码增量**：`predictor_repro.py`（--residual-on-test）；数据增量：`predictor_repro_residual_test50.json`。
+- 同步修正：`11_c4_c14_confidence.md` F5/§4 付费区表述（与 §6.4 精确化一致）。
