@@ -1,0 +1,16 @@
+技术栈：TensorRT · CUDA Streams · NVIDIA Triton · C++ · Python
+
+实习概述
+在 Kosmo 产品线负责 SfM 局部特征（DaD / DeDoDe / LoMa）推理链路的部署与性能优化：完成 TensorRT 引擎接入与 profiling，将 LoMa-L 匹配器以 C++ 重写并落地 in-process 推理；围绕时延、吞吐与服务稳定性持续调优，支撑后续 SVLM 部署。
+
+链路分析与瓶颈定位
+梳理 DaD 检测、DeDoDe 描述子与 LoMa Matcher 的模型结构与跨分辨率数据流（1024 letterbox → 原图 → 784 描述子画布），结合分段 profiling 将端到端瓶颈收敛至 DaD cache 阶段，并下钻至算子与 CPU↔GPU 同步开销，缩小优化范围。
+
+Pipeline 优化（GPU Remap）
+定位 DaD↔DeDoDe 间 CPU 侧关键点 remap 为主要 I/O 瓶颈：实现 CUDA kernel 完成 letterbox→原图像素→描述子归一化坐标的 in-place 重映射，消除每 view 的 D2H/H2D 往返与多余 cudaStreamSynchronize，使 remap 与后续描述子上传/推理同 stream 排队；在 MegaDepth / ScanNet / HardMatch 上，DaD+DeDoDe cache 阶段提速约 11%–17%（匹配结果数值等价）。
+
+精度与部署优化
+针对全流程 FP32 推理成本偏高，按模块敏感度推进 TensorRT 混合精度（如检测 FP16mix、描述/匹配 BF16），在控制匹配精度损失的前提下压缩推理开销，为 SVLM 部署预留性能余量。
+
+并行调度优化
+基于 CUDA Stream 重构异步执行路径，减少 det→remap→desc 阶段间串行等待与强制同步，提升 CPU 图像预处理与 GPU 推理的 overlap，提高局部特征流水线并发效率。
