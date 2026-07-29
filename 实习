@@ -18,3 +18,5 @@ Pipeline 优化（GPU Remap）
 在 Kosmo 产品线参与基于 OpenMVG 的增量 SfM 系统建设，负责局部特征匹配后端的推理部署与性能优化。核心链路为 DaD 关键点检测 → DeDoDe 描述子提取 → LoMa Matcher 密集匹配（dad_dedode_loma_b/l）：检测侧采用 1024 keep-aspect letterbox，描述侧为 784 画布，经关键点坐标 remap 衔接后写入 GPU cache，再按图像对调用 Matcher。将原 Python/外置 CLI 路径收敛为进程内 TensorRT 运行时（loma_trt_runtime / libloma_trt_core.so），完成 LoMa-L 的 C++ 重写与对接，并支持按 GPU SM 加载生产 engine；同时参与 NVIDIA Triton 侧服务化部署与稳定性治理。围绕端到端时延、吞吐与数值一致性，在 MegaDepth / ScanNet / HardMatch 等公开评测上持续 profiling 与调优（含 GPU remap、混合精度、CUDA Stream 异步调度），为后续 SVLM 接入预留算力余量。
 
 LoMa-L重写描述：将 PyTorch eager 特征匹配流水线（Detector / Descriptor / Matcher）重写为约 1.8 万行 C++/CUDA 生产路径，模块边界与 GGUF 权重一一对应；通过持久 CUDA executor、设备常驻交接与 Matcher 融合（Flash Attention、score filter、算子融合），消除中间 tensor 物化与冗余 H2D/D2H，并合并单次图像预处理。A800 上 Matcher 约 4.9×，端到端 MegaDepth1500 约 1.5×，AUC 与 Python 基线持平。
+
+C++/CUDA 推理重构：参与将 LoMa-L（DaD/DeDoDe/Matcher）从 PyTorch Eager 落地为约 1.8 万行 C++/CUDA 生产路径，推进持久 CUDA Executor、设备常驻交接与 Matcher 融合优化；A800 上 Matcher ≈4.9×、MegaDepth1500 端到端 ≈1.5×，AUC 与 Eager 基线持平。
