@@ -20,3 +20,5 @@ Pipeline 优化（GPU Remap）
 LoMa-L重写描述：将 PyTorch eager 特征匹配流水线（Detector / Descriptor / Matcher）重写为约 1.8 万行 C++/CUDA 生产路径，模块边界与 GGUF 权重一一对应；通过持久 CUDA executor、设备常驻交接与 Matcher 融合（Flash Attention、score filter、算子融合），消除中间 tensor 物化与冗余 H2D/D2H，并合并单次图像预处理。A800 上 Matcher 约 4.9×，端到端 MegaDepth1500 约 1.5×，AUC 与 Python 基线持平。
 
 C++/CUDA 推理重构：参与将 LoMa-L（DaD/DeDoDe/Matcher）从 PyTorch Eager 落地为约 1.8 万行 C++/CUDA 生产路径，推进持久 CUDA Executor、设备常驻交接与 Matcher 融合优化；A800 上 Matcher ≈4.9×、MegaDepth1500 端到端 ≈1.5×，AUC 与 Eager 基线持平。
+
+**C++/CUDA推理重构：**参与将局部特征链路（DaD / DeDoDe / LoMa-L Matcher）由 PyTorch Eager 重构为约 1.8 万行 C++/CUDA 生产实现，协同优化持久化 CUDA Executor、中间数据 GPU 常驻与模块交接，并针对 Matcher 热点推进 FlashAttention、score filter及FFN / RoPE 算子融合；重构后，A800 上 Matcher 提速约 4.9 倍、MegaDepth-1500 端到端提速约 1.5 倍，AUC 与 PyTorch Eager 基线持平。
