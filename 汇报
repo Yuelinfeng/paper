@@ -1,0 +1,162 @@
+# MoE Offload 预取与动作选择：实验进展汇报
+**日期**：2026-08-17  
+**阶段**：信号刻画与模拟器原型已完成；真实端到端加速尚未验证；主线已转向 Track A（动作价值相图）
+
+---
+
+## 1. 一句话现状
+
+我们想解决的问题是：在 GPU 装不下全部专家、需要把专家 offload 到 CPU/磁盘的 MoE 推理里，**能否用路由预测提前搬运权重，减少 GPU 空等**。
+
+目前已经证明：**跨层路由信号真实存在**，并且在简化模拟器里**“用预测做预取/驻留”相对纯 LRU 有方向性收益**；但还**没有**在真实系统上测出 tokens/s 或 TPOT 加速。同时，文献与自身实验都提示：瓶颈可能不只是“预测准不准”，而是**同一预测在不同系统压力下该选什么内存动作**。当前主线因此从“训更好的 predictor”转向 **ForeAct：刻画预测→动作→系统状态的价值表面**。
+
+---
+
+## 2. 问题背景与核心想法
+
+### 2.1 工程痛点
+
+Mixtral、DeepSeek-V2、Qwen3 等 MoE 每层只激活少数专家。模型过大时，暂时不用的专家放在 CPU/磁盘，用到再搬进 GPU——搬运期间 GPU 空转，推理变慢。
+
+### 2.2 朴素想法（早期）
+
+在计算第 \(L\) 层时，若能猜出第 \(L+1, L+2, \ldots\) 层会用哪些专家，即可提前搬运，使 **计算与传输重叠**，消除等待。
+
+### 2.3 想法演进（当前主线）
+
+文献中对“预测预取”的结论并不一致：部分工作在可重叠窗口下报告收益，WiSP 等则指出单流 decode 下预取可能因带宽与缓存污染反而变差。我们的工作假设是：
+
+> **路由预测只是信息，不等于预取。**  
+> 预测的系统价值 \(= f(\)预测质量, 提前量, 重叠窗口, 传输体量, 缓存容量与污染, KV 压力, 传输队列\()\)。
+
+因此论文主张重新排序为：
+
+1. **核心贡献（待证）**：在统一资源约束下刻画 `forecast × action × system regime → 边际性能` 的相图；  
+2. **兑现**：若相图存在可迁移边界，再做状态感知控制器 ForeAct-MoE；  
+3. **落地**：单 GPU、不改路由/不改输出的 runtime + 受约束 oracle，分离“更准预测”与“更好动作选择”。
+
+> 明确放弃把“预测更准 / gate-ahead 本身”当作主新颖性——该方向已较拥挤（HOBBIT、DALI、Diff-MoE 等）。
+
+---
+
+## 3. 已完成工作：两条实验线
+
+### 实验线 A —— Gate Input Ahead Prefetch（“猜得准不准”）
+
+**目的**：不训练 predictor，测量**当前层 gate 输入 hidden state 本身**携带多少关于未来层路由的信息（信号上界）。
+
+**方法**：对同一 token，取源层 \(s\) 的 gate 输入 \(h_s\)，直接送入目标层 \(t=s+a\) 的真实 gate 权重，得到预测 Top-\(k\)，再与目标层真实激活专家对比。
+
+$$
+\hat{E}_{i,t}=\operatorname{TopK}\bigl(G_t(h_{i,s})\bigr),\quad t=s+a
+$$
+
+**设置**：ShareGPT 前 50 条（DeepSeek-V2-Lite 另跑 50–99 对照）；每样本生成 64 token；BF16。
+
+| 模型               | 层数 | \(E\) | \(k\) | ahead | 状态                  | ahead=1 时 Recall@\(k\) |
+| ------------------ | ---: | ----: | ----: | ----- | --------------------- | ----------------------: |
+| DeepSeek-V2-Lite   |   26 |    64 |     6 | 1–25  | 完成（两组）          |                   ~0.81 |
+| Qwen3-30B-A3B      |   48 |   128 |     8 | 1–47  | 完成                  |                   ~0.87 |
+| Mixtral-8×7B       |   32 |     8 |     2 | 1–31  | 完成                  |                   ~0.85 |
+| Mixtral-8×22B      |   56 |     8 |     2 | 1–55  | 完成（曾 OOM 后重跑） |                   ~0.85 |
+| DeepSeek-V2 (full) |    — |   160 |     6 | 1–59  | OOM 中断              |                       — |
+| DeepSeek-V4-Flash  |    — |   256 |     6 | 1–42  | 手动停止（过慢）      |                       — |
+
+**主要观察**：
+
+1. **前瞻 1 层重合率最高**：各模型 Recall@自身 \(k\) 约 **81%–87%**（\(k\)、\(E\) 不同，不可直接横比绝对数值）。  
+2. **前瞻越远越不准**：每多一层大约掉 **1–2 个百分点**；更适合短窗口预取。  
+3. **切片较稳**：DeepSeek-V2-Lite 两组 50 条 prompt，ahead 曲线平均绝对差约 **0.37–0.62 个百分点**。  
+4. **层间异质性**：固定 ahead 下逐层 Recall 约 0.54–0.92，说明预测质量本身随层变化。  
+5. **加权召回通常高于集合召回**：漏掉的多是低权重专家。
+
+**含义边界**：这是“作弊式”上界（直接用目标层真 gate），**不是**可部署 predictor；也**不能**推出端到端加速。
+
+---
+
+### 实验线 B —— Trace Ahead Simulator（“假设猜对了能省多少”）
+
+**目的**：用真实路由 trace，在统一简化时间模型下比较缓存/预取/混合策略，回答“预测信息有没有转化为模拟延迟收益”。
+
+**数据**：Qwen3-235B-A22B-FP8 × 中华文化 SimpleQA，**326** 条 request（train 199 / val 57 / test 70）；时间单位为 **normalized layer slot**（一层计算=1，搬一次专家=0.5 等简化规则），**不是**真实硬件 TPOT。
+
+**M4 冻结结论（单 subject、参数化模拟，preliminary）**：
+
+| 对比（相对 LRU 等基线）                               |    cache 5% | cache 20% |
+| ----------------------------------------------------- | ----------: | --------: |
+| History retention 降 normalized TPOT                  |        ~35% |     ~4.4% |
+| Full Transition manager vs 孤立 Transition prefetch   |    明显更好 |    仍更好 |
+| Transition prefetch 相对 History retention 的额外收益 | 很小（~1%） |      很小 |
+
+在 SUMMARY 汇总口径下（cache_fraction=0.2）：Transition 相对纯 LRU 模拟延迟约低 **5.8%**；Hybrid 约低 **4.5%**，但及时预取命中更高。
+
+**解释**：收益主要来自 **History retention（该留的专家留住）**；“预测后直接预取”与“统一管理（admission/eviction/调度）”差别显著——这正支持主线从“预测准”转向“动作选对”。
+
+**未完成**：ForeAct 正式 sweep（约 1018 配置）仅完成约 **11%**（7/64 shard）；大模型 gate 实验与 vLLM DeepSeek-V4（A100/DeepGEMM 不支持）失败或中断。
+
+---
+
+## 4. 当前能说什么 / 不能说什么
+
+| 能说                                               | 不能说                                              |
+| -------------------------------------------------- | --------------------------------------------------- |
+| 当前层 hidden 与后几层路由有统计关联，且随距离衰减 | 已实现推理加速（无 tokens/s、TTFT、真实 TPOT 对比） |
+| 多架构（DeepSeek / Qwen / Mixtral）均存在该信号    | 某模型“更好预测”（\(k\)/\(E\)/层数不同）            |
+| 特定模拟假设下，预测驱动策略优于纯 LRU             | 模拟百分比 = 真实硬件收益                           |
+| “预测质量 ≠ 动作价值”有动机与预备证据              | 预测器已可部署；或已证明动作价值正负反转            |
+
+---
+
+## 5. 正在推进：Track A（生死关）
+
+按预注册协议，Track A 要回答三个 Go/No-Go 问题（同一 forecast、容量、带宽、release-time、投机传输上限）：
+
+1. 同一 forecast-driven 动作的 request 级边际价值，是否在可观压力区域分别显著为正与为负？  
+2. 最优可行动作是否随区域改变（而非仅 latency–H2D Pareto 交换）？  
+3. 用归一化压力坐标表达的边界，能否迁移到未见过的 subject/workload？
+
+**数据纪律**：M4 的 70-request test 已冻结退役，**不得**再用于选坐标/阈值/controller；A-dev 仅用 validation；A-holdout 为同模型另一 subject（自然与自然科学），协议冻结前未窥探内容。
+
+**模拟器补齐（A0）**：release-time 正确的 forecast-ready 事件、bounded queue、stream-and-evict、KV 压力代理等——能力审计与多轮 amendment 已写入 `runs/trace_ahead/foreact_a0_v1/`。
+
+**若 Track A No-Go**（某固定策略全域占优、反转在 equal-budget/CI/holdout 上消失）：及时转向负结果或特化问题，**不**盲目堆完整 controller。
+
+---
+
+## 6. 距离真实加速还差什么
+
+1. **可部署 predictor**（或明确用 Transition/History 等离散 forecast 即可）：当前 gate 实验是上界信号。  
+2. **Track A 相图闭环**：完整 sweep + 统计 CI + holdout 复现。  
+3. **真机成本标定（Track B）**：DRAM→HBM 曲线、copy 队列、控制开销 → 喂给动作价值模型。  
+4. **端到端 runtime（Track D）**：predictor/forecast + prefetch scheduler + offload engine，测真实 tokens/s / TPOT。  
+5. **更长、更多样 workload**：50 prompt × 64 token 偏短；需跨任务与跨模型 holdout。
+
+---
+
+## 7. 希望导师指导的问题
+
+1. **主线是否认可**：把核心贡献定为“forecast-to-action 价值相图”，而不是“更好的专家预测器”？  
+2. **Track A 的 Go 标准**是否过严或过松？若短期扫不出正负反转，是否接受以“负结果 + 特化场景”作为论文形态？  
+3. **真机优先级**：应先在 DeepSeek-V2-Lite / Mixtral-8×7B 上做小规模 output-preserving runtime，还是先把模拟器相图做到可投稿？  
+4. **相关工作划界**：相对 WiSP / Diff-MoE / DALI，导师是否认为“同一预测、不同压力下动作切换”足够构成增量？  
+5. **资源边界**：大模型（DeepSeek-V2 full、V4-Flash）刻画性价比低，是否同意主表固定在已完成的四模型 + Qwen-235B trace？
+
+---
+
+## 8. 关键材料索引
+
+| 文档                                                        | 内容                           |
+| ----------------------------------------------------------- | ------------------------------ |
+| `docs/motivation/故事_final.md`                             | 论文叙事与贡献排序（ForeAct）  |
+| `docs/moe_trace_ahead_experiment_plan.md`                   | Track A-first 执行手册         |
+| `docs/experiment_exploration_summary.md`                    | GateAhead 实验细节与大模型踩坑 |
+| `runs/SUMMARY.md`                                           | runs 产物速查与口径边界        |
+| `runs/trace_ahead/foreact_a0_v1/TRACK_A_PREREGISTRATION.md` | Track A 预注册                 |
+| `reports/prefetch_characterization/`                        | 跨模型 Recall 对比表           |
+
+---
+
+## 9. 汇报结语
+
+**信号存在，模拟有方向，主线已从“预测准不准”收敛到“预测何时、以何种动作值钱”。**  
+下一步的关键决策是：集中资源完成 Track A 的 Go/No-Go；通过后再投入 controller 与真机，避免在未验证相图的情况下过早堆系统。
