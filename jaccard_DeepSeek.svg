@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="442" height="432" viewBox="0 0 442 432">
+<rect width="100%" height="100%" fill="white"/>
+<text x="221.0" y="26" text-anchor="middle" font-size="15" font-family="sans-serif">Jaccard 热图 DeepSeek-R1（topN=C≈5%，层均值）</text>
+<text x="104" y="113.0" text-anchor="end" font-size="11" font-family="sans-serif">lcb</text>
+<text x="149.0" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">lcb</text>
+<text x="104" y="191.0" text-anchor="end" font-size="11" font-family="sans-serif">aime</text>
+<text x="227.0" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">aime</text>
+<text x="104" y="269.0" text-anchor="end" font-size="11" font-family="sans-serif">mmlu</text>
+<text x="305.0" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">mmlu</text>
+<text x="104" y="347.0" text-anchor="end" font-size="11" font-family="sans-serif">mmlu_ZH</text>
+<text x="383.0" y="62" text-anchor="middle" font-size="11" font-family="sans-serif">mmlu_ZH</text>
+<rect x="110" y="70" width="78" height="78" fill="rgb(37,99,235)" stroke="#fff"/>
+<text x="149.0" y="113.0" text-anchor="middle" font-size="12" fill="#fff" font-family="sans-serif">1.00</text>
+<rect x="188" y="70" width="78" height="78" fill="rgb(181,202,248)" stroke="#fff"/>
+<text x="227.0" y="113.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.20</text>
+<rect x="266" y="70" width="78" height="78" fill="rgb(223,232,252)" stroke="#fff"/>
+<text x="305.0" y="113.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.09</text>
+<rect x="344" y="70" width="78" height="78" fill="rgb(222,231,251)" stroke="#fff"/>
+<text x="383.0" y="113.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.09</text>
+<rect x="110" y="148" width="78" height="78" fill="rgb(181,202,248)" stroke="#fff"/>
+<text x="149.0" y="191.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.20</text>
+<rect x="188" y="148" width="78" height="78" fill="rgb(37,99,235)" stroke="#fff"/>
+<text x="227.0" y="191.0" text-anchor="middle" font-size="12" fill="#fff" font-family="sans-serif">1.00</text>
+<rect x="266" y="148" width="78" height="78" fill="rgb(208,221,250)" stroke="#fff"/>
+<text x="305.0" y="191.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.13</text>
+<rect x="344" y="148" width="78" height="78" fill="rgb(214,225,251)" stroke="#fff"/>
+<text x="383.0" y="191.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.11</text>
+<rect x="110" y="226" width="78" height="78" fill="rgb(223,232,252)" stroke="#fff"/>
+<text x="149.0" y="269.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.09</text>
+<rect x="188" y="226" width="78" height="78" fill="rgb(208,221,250)" stroke="#fff"/>
+<text x="227.0" y="269.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.13</text>
+<rect x="266" y="226" width="78" height="78" fill="rgb(37,99,235)" stroke="#fff"/>
+<text x="305.0" y="269.0" text-anchor="middle" font-size="12" fill="#fff" font-family="sans-serif">1.00</text>
+<rect x="344" y="226" width="78" height="78" fill="rgb(145,176,244)" stroke="#fff"/>
+<text x="383.0" y="269.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.30</text>
+<rect x="110" y="304" width="78" height="78" fill="rgb(222,231,251)" stroke="#fff"/>
+<text x="149.0" y="347.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.09</text>
+<rect x="188" y="304" width="78" height="78" fill="rgb(214,225,251)" stroke="#fff"/>
+<text x="227.0" y="347.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.11</text>
+<rect x="266" y="304" width="78" height="78" fill="rgb(145,176,244)" stroke="#fff"/>
+<text x="305.0" y="347.0" text-anchor="middle" font-size="12" fill="#111" font-family="sans-serif">0.30</text>
+<rect x="344" y="304" width="78" height="78" fill="rgb(37,99,235)" stroke="#fff"/>
+<text x="383.0" y="347.0" text-anchor="middle" font-size="12" fill="#fff" font-family="sans-serif">1.00</text>
+<text x="110" y="418" font-size="10" fill="#555" font-family="sans-serif">判据：J≥0.5 强 / 0.3≤J&lt;0.5 弱 / J&lt;0.3 失败</text>
+</svg>
