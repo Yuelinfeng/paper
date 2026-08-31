@@ -22,3 +22,13 @@ LoMa-L重写描述：将 PyTorch eager 特征匹配流水线（Detector / Descri
 C++/CUDA 推理重构：参与将 LoMa-L（DaD/DeDoDe/Matcher）从 PyTorch Eager 落地为约 1.8 万行 C++/CUDA 生产路径，推进持久 CUDA Executor、设备常驻交接与 Matcher 融合优化；A800 上 Matcher ≈4.9×、MegaDepth1500 端到端 ≈1.5×，AUC 与 Eager 基线持平。
 
 **C++/CUDA推理重构：**参与将局部特征链路（DaD / DeDoDe / LoMa-L Matcher）由 PyTorch Eager 重构为约 1.8 万行 C++/CUDA 生产实现，协同优化持久化 CUDA Executor、中间数据 GPU 常驻与模块交接，并针对 Matcher 热点推进 FlashAttention、score filter及FFN / RoPE 算子融合；重构后，A800 上 Matcher 提速约 4.9 倍、MegaDepth-1500 端到端提速约 1.5 倍，AUC 与 PyTorch Eager 基线持平。
+
+技术栈：C++17 / CUDA / TensorRT / Nsight Systems · NCU / 多流异步 · 有界并发调度 / bit-exact 精度回归
+
+实习概述：负责大规模 SfM 三维重建 pipeline 中特征匹配（CFM）推理链路的性能优化。在模型数值路径不变、输出 bit-exact、20GB 软件显存门的约束下，通过异步流水重构 + 有界显存调度，端到端时延 −22.1%、峰值显存 −55.8%（33.6→14.9GB，压进 24GB 预算）；同卡对比、优化侧多轮 CV 0.18%，全部收益在统一计时口径 + SHA 身份链下可复现。
+
+异步流水重构（端到端 −22.1%）：将特征提取（Phase1）与特征匹配（Matcher）的依赖粒度从"阶段级"细化到"view 级"——单个 view 特征就绪即触发其相关图像对进入匹配，用 CUDA event（cudaStreamWaitEvent）在 GPU 侧建立依赖而不阻塞 CPU 主线程，实现两阶段跨阶段 overlap；并通过 depth/worker 灵敏度对照 + 算子累计时间不变而墙钟下降的背离分析 + Matcher 流空泡指标收缩，三重独立证据闭环证明收益来自阶段重叠而非并发调参。
+
+有界显存调度（峰值显存 −55.8%）：设计三层背压——host 有界预取队列 + GPU 常驻集高低水位迟滞背压 + 看门狗 fail-closed，将峰值显存压进 20GB 软件门，把原本会 OOM 的负载压进 24GB 预算，全程无 OOM、无 spill。
+
+正确性门禁与可复现：建立 bit-exact parity gate（覆盖率==1.0、坐标误差 p99≤0.5px、score 误差 p99≤1e-4）+ 五要素 SHA 身份链 + Frozen Gate 冻结配置，保证每个性能数字可回溯到 pair 粒度、输出与基线逐点一致，同身份冷启动多轮 CV<1%。
