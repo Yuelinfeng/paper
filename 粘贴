@@ -1,1 +1,294 @@
 https://deeplink.org.cn/kernelswift/task-view?taskId=0cd7a889-918e-4e44-acb4-2d200121122e
+
+## 1. 在 LLM 背景下，FlashAttention 是什么
+
+标准 Attention 的数学形式是：
+
+\[
+O=\operatorname{Softmax}\left(\frac{QK^T}{\sqrt{D}}\right)V
+\]
+
+其中，若序列长度为 \(T\)，注意力分数矩阵 \(QK^T\) 的形状是 `[T, T]`。
+
+普通实现通常是：
+
+```text
+Q、K、V
+→ 计算 score = QKᵀ                 # [T, T]
+→ 将 score 写回显存
+→ Softmax(score)                   # [T, T]
+→ 再写回显存
+→ probability × V
+```
+
+问题不在于 Attention 的数学计算本身，而在于中间的 `[T, T]` 矩阵很大，频繁写入、读取 GPU 显存。对 LLM 的长上下文 prefill 而言，这会成为明显的显存和带宽瓶颈。
+
+FlashAttention 的核心思想是：
+
+```text
+将 Q 分块
+→ 逐块读取 K/V
+→ 在 GPU 片上存储中完成 QKᵀ、Softmax、乘 V
+→ 使用 online Softmax 累积结果
+→ 不物化完整的 [T, T] 分数/概率矩阵
+```
+
+因此它：
+
+- 不改变 Attention 的语义；
+- 不把 Attention 的算术复杂度从 \(O(T^2D)\) 变成线性；
+- 主要减少 \(O(T^2)\) 中间矩阵的显存占用与显存读写；
+- 通常显著改善长序列 Attention 的吞吐和延迟。
+
+---
+
+## 2. LoMa-B 当前为什么需要 FlashAttention
+
+虽然 LoMa-B 不是自回归 LLM，但它的 Matcher 内部同样是 Transformer Attention：输入序列经过 Q/K/V 投影后，进行 Self-Attention 和 Cross-Attention。
+
+从通用 Transformer 推理角度，它面对的问题是：
+
+```text
+序列较长
++ 每层都有 Self-Attention
++ 还需要 Cross-Attention
++ BF16 Tensor Core 已经较快
+→ Attention 中间矩阵的显存读写变得突出
+```
+
+在 SM89 的 LoMa-B 路径中，初始 token 数是 2048。即使不考虑任何具体业务，单个 head 的 score 矩阵也是：
+
+```text
+2048 × 2048 = 4,194,304 个元素
+```
+
+多 head、多层、Self/Cross Attention 叠加后，若使用普通的分步实现，显存流量会很高。
+
+因此 LoMa-B 在 SM89 上采用 FlashAttention：**避免显式保存完整 Attention matrix，让 Attention 计算更多在 kernel 内完成。**
+
+---
+
+## 3. LoMa-B 用的是哪一种 FlashAttention
+
+LoMa-B 使用的是 **PyTorch 内置的 FlashAttention SDPA 后端**，不是仓库自行编写的 BF16 FlashAttention。
+
+代码直接调用：
+
+```cpp
+at::_scaled_dot_product_flash_attention(
+    query, key, value,
+    0.0,       // dropout
+    false,     // 非 causal
+    false,     // 不要 debug mask
+    1 / sqrt(head_dim));
+```
+
+位置在 [matcher_runtime.cpp](/home/liushouliang/llf/loma.cpp/src/runtime/cuda/matcher_runtime.cpp:2032)。
+
+运行链为：
+
+```text
+LoMa-B 准备 Q/K/V
+→ 调用 PyTorch ATen FlashAttention 接口
+→ PyTorch libtorch_cuda.so 中的 BF16 FlashAttention kernel
+→ 返回 context
+→ LoMa-B 再做 output projection / FFN
+```
+
+当前环境中 PyTorch 为 `2.11.0+cu128`；实际 Flash CUDA 实现已编译在：
+
+```text
+/home/liushouliang/llf/envs/cu128-trt11/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so
+```
+
+其中包含：
+
+```text
+at::native::_scaled_dot_product_flash_attention_cuda(...)
+pytorch_flash::run_mha_fwd_<cutlass::bfloat16_t, ...>(...)
+pytorch_flash::flash_fwd_kernel<...>
+```
+
+所以可以理解为：**LoMa-B 调用 PyTorch 的成熟 FlashAttention 实现，而不是自己维护 Attention 主 kernel。**
+
+---
+
+## 4. 为什么使用 PyTorch 自带实现，而不是自定义 FlashAttention
+
+原因不是“自定义做不到”，而是 LoMa-B 当前 BF16 路径没有足够理由承担自定义 Attention kernel 的成本。
+
+| 对比点 | 使用 PyTorch 内置 FlashAttention | 自定义 FlashAttention |
+|---|---|---|
+| 核心 kernel | 使用成熟实现 | 需要自行写、调优、验证 |
+| BF16 与 Tensor Core | 已处理 | 需自行适配 |
+| 不同 head_dim / shape | PyTorch 内部已选择相应 kernel | 需要维护大量模板和 dispatch |
+| 数值稳定性 | 已有成熟的 online Softmax 实现 | 需大量精度验证 |
+| CUDA/PyTorch 版本兼容 | 由 PyTorch 负责 | 自己承担 ABI、编译器、CUDA 兼容风险 |
+| 维护成本 | 低 | 高 |
+| LoMa-B 当前需求 | BF16、标准非 causal Attention | 不需要为此专门重写主 kernel |
+
+LoMa-B 的策略是把“最适合业务模型结构的部分”留给自己优化：
+
+```text
+QKV 拆分
++ RoPE
++ A/B batch=2 合并
++ Cross-Attention 的 K/V 交换与打包
++ 避免无意义 copy
+```
+
+而将最复杂、最成熟的 Attention 主计算交给 PyTorch。
+
+仓库确实存在自定义 FlashAttention 相关代码：
+
+```text
+third_party/flash_attention
+src/runtime/cuda/fp8_attention_sm89/fa2_matcher_plugin.cu
+```
+
+但这是 SM89 上的 **FP8 FA2 plugin 分支**，不属于 LoMa-B 当前的 BF16 FlashAttention 路线。对 LoMa-B 来说，直接复用 PyTorch BF16 FlashAttention 更符合当前精度、稳定性和维护目标。
+
+---
+
+## 5. LoMa-B 在调用 FlashAttention 前做了什么
+
+FlashAttention 并不能直接吃任意形状的 Q/K/V。LoMa-B 先把 Transformer 层的输出整理为适合 Attention 的布局。
+
+普通逻辑是：
+
+```python
+qkv = linear(x, Wqkv)        # [T, 3E]
+
+q, k, v = split(qkv)         # 三个 Tensor
+q = rope(q)
+k = rope(k)
+q = reshape_layout(q)
+k = reshape_layout(k)
+v = reshape_layout(v)
+
+context = flash_attention(q, k, v)
+```
+
+LoMa-B 将中间步骤融合为一个 CUDA kernel：
+
+```python
+qkv = linear(x, Wqkv)        # [T, 3E]
+
+q, k, v = fused_qkv_rope_layout(
+    qkv,
+    cosine,
+    sine,
+    output_layout="[B, H, T, D]"
+)
+
+context = torch_flash_attention(q, k, v)
+```
+
+这个 LoMa-B 自定义 kernel 一次完成：
+
+1. 从交错 QKV 输出中拆出 Q、K、V；
+2. 对 Q、K 应用 RoPE；
+3. 将三者直接写为 FlashAttention 所需的 `[B, H, T, D]` 布局；
+4. 避免额外的切分、RoPE 和 `permute().contiguous()` 操作。
+
+实现在 [kernels.cu](/home/liushouliang/llf/loma.cpp/src/runtime/cuda/kernels.cu:919)，Self-Attention 的调用点在 [matcher_runtime.cpp](/home/liushouliang/llf/loma.cpp/src/runtime/cuda/matcher_runtime.cpp:3731)。
+
+---
+
+## 6. Self-Attention 中如何使用
+
+逻辑可以抽象为：
+
+```python
+def self_attention(x, Wqkv, rope):
+    # BF16 Linear，生成 [T, 3E]
+    qkv = linear(x, Wqkv)
+
+    # LoMa-B 自定义融合准备
+    q, k, v = fused_qkv_rope_layout(
+        qkv, rope.cos, rope.sin,
+        layout="BHSD"           # [1, H, T, D]
+    )
+
+    # PyTorch 内置 FlashAttention
+    context = flash_attention(
+        q, k, v,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1 / sqrt(D)
+    )
+
+    # [1, H, T, D] → [T, E]
+    return context.permute(0, 2, 1, 3).reshape(T, E)
+```
+
+这里 `is_causal=False` 很重要：它与标准 Decoder LLM 的 causal self-attention 不同。LoMa-B 的 Attention 没有“当前位置只能看过去 token”的下三角限制。
+
+---
+
+## 7. Cross-Attention 中如何使用
+
+Cross-Attention 需要计算两个方向：
+
+```text
+A 读取 B：Q=A，K=B，V=B
+B 读取 A：Q=B，K=A，V=A
+```
+
+最直接的写法是两次 FlashAttention：
+
+```python
+out_a = flash_attention(q_a, k_b, v_b)
+out_b = flash_attention(q_b, k_a, v_a)
+```
+
+LoMa-B 尽量将其合为一次 batch=2 调用：
+
+```python
+def paired_cross_attention(q_a, v_a, q_b, v_b):
+    # batch 0: A 读取 B
+    # batch 1: B 读取 A
+    Q = [q_a, q_b]
+    K = [q_b, q_a]
+    V = [v_b, v_a]
+
+    context = flash_attention(
+        Q, K, V,               # [2, H, T, D]
+        dropout_p=0.0,
+        is_causal=False,
+        scale=1 / sqrt(D)
+    )
+
+    return context[0], context[1]
+```
+
+实现位置：
+
+- Cross-Attention 的 batch=2 组织：[matcher_runtime.cpp](/home/liushouliang/llf/loma.cpp/src/runtime/cuda/matcher_runtime.cpp:4248)
+- K/V 打包 kernel：[kernels.cu](/home/liushouliang/llf/loma.cpp/src/runtime/cuda/kernels.cu:1017)
+
+一个额外优化是：若 A/B 的 Q 已经在同一块连续显存中，LoMa-B 用 `as_strided` 将其直接解释为 batch=2，不再复制 Q；只为必须交换方向的 K/V 执行打包。
+
+---
+
+## 8. 使用后的效果
+
+从 LLM 推理视角，效果分为三个层次。
+
+| 层次 | FlashAttention / LoMa-B 布局优化带来的效果 |
+|---|---|
+| Attention 主计算 | 不物化完整 `[T, T]` score/probability 矩阵，降低显存占用和 HBM 读写 |
+| 输入准备 | QKV 拆分、RoPE、布局转换合并，减少临时 Tensor 和 kernel launch |
+| 双路 Attention | A/B 合并为 batch=2，减少两次独立调用的调度与数据准备开销，提高 GPU 利用率 |
+
+因此整体效果不是“Attention 从二次复杂度变成线性”，而是：
+
+```text
+保留原本 Attention 的计算语义
++ 保留二次 token 两两交互
+- 移除大规模中间矩阵物化
+- 减少 QKV 前后处理的显存搬运
+- 在可能时将两路 Attention 合为一个 batch=2 调用
+```
+
+具体节省多少延迟或显存，需要用目标 GPU、token 数、head 数和实际层数做 profiling；仅凭代码不能严谨给出固定百分比。
