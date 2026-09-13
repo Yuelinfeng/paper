@@ -1,1 +1,54 @@
 
+最符合通用 LLM 推理优化思路的是 **F1、F2，以及 FlashAttention 本身**。
+
+| 优先级 | 部分 | 为什么对 LLM 最重要 |
+|---:|---|---|
+| 1 | FlashAttention | 解决长上下文 Attention 的显存读写瓶颈；不物化完整 \(T \times T\) Attention 矩阵，是主流 LLM prefill 优化。 |
+| 2 | F1：QKV 拆分 + RoPE + Attention 布局 | 几乎所有带 RoPE 的 LLM 都需要 QKV、RoPE 和 Attention layout；融合可减少 Q/K/V 的中间 Tensor、转置和显存复制。 |
+| 3 | F2：LayerNorm + affine + GELU + cast | LLM 每层都有 Norm 和 MLP 激活；将这些逐元素/归约算子融合是典型的推理 kernel 优化。实际 LLM 中更常见的是 RMSNorm + SiLU/SwiGLU，而非 LayerNorm + GELU。 |
+
+F3 也属于通用 LLM 技术，但重要性略低：
+
+```text
+Linear output + residual add
+```
+
+这是常见的 GEMM epilogue fusion。通常应尽量并入 GEMM 的 epilogue，例如：
+
+```python
+y = x @ W.T + bias + residual
+```
+
+它能减少一次对 Linear 输出的写回与读取。
+
+CAT 则不适合作为通用 LLM 的首要学习重点：
+
+```text
+A/B FP32 state + BF16 message 拼接
+```
+
+它依赖 LoMa-B 的双路状态结构和特定 FFN 输入形式。通用 LLM 的 MLP 往往是：
+
+```text
+x
+→ gate_proj / up_proj
+→ SiLU(xWg) ⊙ (xWu)
+→ down_proj
+→ residual
+```
+
+没有同样的 `[state | message]` 拼接，因此不能直接复用。
+
+可以把通用 LLM 的对应优化链记为：
+
+```text
+QKV GEMM
+→ fused RoPE / layout
+→ FlashAttention
+→ output projection + residual epilogue
+→ fused RMSNorm
+→ fused SwiGLU
+→ down projection + residual epilogue
+```
+
+其中 LoMa-B 的 F1、F2、F3 分别对应这条链里的 Attention 前处理、Norm/激活融合、以及 residual epilogue。
