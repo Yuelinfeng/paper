@@ -1,0 +1,13 @@
+ffn_a = cat([state_a.to(bf16), message_a], dim=-1)
+ffn_b = cat([state_b.to(bf16), message_b], dim=-1)
+
+hidden_a = linear0(ffn_a)
+hidden_b = linear0(ffn_b)
+
+
+def fused_mixed_concat(state_a_fp32, message_a_bf16,
+                       state_b_fp32, message_b_bf16):
+    for side in [A, B]:
+        out[side, :, :E] = bf16(state[side])   # 转 BF16
+        out[side, :, E:] = message[side]       # 直接拷贝
+    return out  # [2T, 2E]
