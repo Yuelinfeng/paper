@@ -1,1 +1,13 @@
-
+```mermaid
+flowchart LR
+  X[输入状态] --> QKV[QKV Linear]
+  QKV --> F1[融合：拆分 QKV + RoPE + Flash 布局]
+  F1 --> ATTN[FlashAttention]
+  ATTN --> OP[输出 Linear]
+  X --> CAT[融合：A/B FP32 state + BF16 message 拼接]
+  OP --> CAT
+  CAT --> L0[FFN Linear0]
+  L0 --> F2[融合：LayerNorm + affine + GELU + BF16 cast]
+  F2 --> L3[FFN Linear3]
+  L3 --> F3[融合：FP32 residual + BF16 projection]
+```
