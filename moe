@@ -1,54 +1,251 @@
-
-最符合通用 LLM 推理优化思路的是 **F1、F2，以及 FlashAttention 本身**。
-
-| 优先级 | 部分 | 为什么对 LLM 最重要 |
-|---:|---|---|
-| 1 | FlashAttention | 解决长上下文 Attention 的显存读写瓶颈；不物化完整 \(T \times T\) Attention 矩阵，是主流 LLM prefill 优化。 |
-| 2 | F1：QKV 拆分 + RoPE + Attention 布局 | 几乎所有带 RoPE 的 LLM 都需要 QKV、RoPE 和 Attention layout；融合可减少 Q/K/V 的中间 Tensor、转置和显存复制。 |
-| 3 | F2：LayerNorm + affine + GELU + cast | LLM 每层都有 Norm 和 MLP 激活；将这些逐元素/归约算子融合是典型的推理 kernel 优化。实际 LLM 中更常见的是 RMSNorm + SiLU/SwiGLU，而非 LayerNorm + GELU。 |
-
-F3 也属于通用 LLM 技术，但重要性略低：
+从 LLM 推理引擎的角度看，性能不是单靠某个 FlashAttention 或融合 kernel 获得的，而是一条完整执行链的结果：
 
 ```text
-Linear output + residual add
+先决定用哪种算子实现
+→ 再把数据准备成该实现最适合的布局
+→ 复用已经申请、构建好的资源
+→ 在执行模式稳定时，用 CUDA Graph 降低调度开销
 ```
 
-这是常见的 GEMM epilogue fusion。通常应尽量并入 GEMM 的 epilogue，例如：
+这四部分可以理解为 LLM runtime 的“执行优化层”。:codex-annotation{index="1"}
+
+```text
+1. Backend dispatch：决定怎么算
+2. Tensor / layout 准备：决定数据怎样摆放
+3. 资源缓存与复用：避免重复准备
+4. CUDA Graph：减少 CPU 发射 kernel 的成本
+```
+
+在完整 LLM 系统中，它们前面还会有请求调度、continuous batching、prefill/decode 分流、KV Cache 管理；这四部分则负责把已确定的 batch 高效地送上 GPU。
+
+---
+
+## 1. Backend dispatch：决定“这次 Attention/GEMM 应该怎么跑”
+
+同一个 Attention 公式，有不同实现：
+
+```text
+FlashAttention
+cuDNN SDPA
+PagedAttention
+decode 专用 kernel
+通用 fallback
+```
+
+它们数学语义相同，但适合的条件不同。LLM runtime 要根据运行状态选择。
 
 ```python
-y = x @ W.T + bias + residual
+if phase == "prefill" and dtype in [BF16, FP16]:
+    backend = FlashAttention
+
+elif phase == "decode" and kv_cache_is_paged:
+    backend = PagedAttention
+
+elif shape_matches_cudnn_plan:
+    backend = cuDNN_SDPA
+
+else:
+    backend = fallback
 ```
 
-它能减少一次对 Linear 输出的写回与读取。
+LLM 中最关键的选择维度包括：
 
-CAT 则不适合作为通用 LLM 的首要学习重点：
+- 阶段：prefill 还是 decode；
+- GPU 架构：SM80、SM89、SM90 等；
+- 精度：BF16、FP8 等；
+- `Q` 的长度、KV Cache 长度、head_dim；
+- Attention 形式：MHA、GQA、MLA；
+- KV Cache 的内存布局：连续还是分页。
+
+LoMa-B 的对应实现较简单：SM89 的 BF16 route 明确选择 PyTorch FlashAttention；SM80/SM90 使用 cuDNN SDPA。它体现的是同一原则：**不要让同一种算子实现覆盖所有硬件和所有 shape。**
+
+---
+
+## 2. Tensor / layout 准备：让数据以 kernel 最喜欢的形式进入 GPU
+
+高性能 kernel 往往不是“拿任意 Tensor 都能最快跑”。例如 FlashAttention 希望 Q/K/V 的 dtype、shape、stride 和布局满足要求。
+
+LLM 中理想路径是：
 
 ```text
-A/B FP32 state + BF16 message 拼接
+hidden states
+→ QKV GEMM
+→ fused RoPE
+→ 直接写为 Attention / KV Cache 所需布局
+→ Attention
 ```
 
-它依赖 LoMa-B 的双路状态结构和特定 FFN 输入形式。通用 LLM 的 MLP 往往是：
-
-```text
-x
-→ gate_proj / up_proj
-→ SiLU(xWg) ⊙ (xWu)
-→ down_proj
-→ residual
-```
-
-没有同样的 `[state | message]` 拼接，因此不能直接复用。
-
-可以把通用 LLM 的对应优化链记为：
+而不是：
 
 ```text
 QKV GEMM
-→ fused RoPE / layout
-→ FlashAttention
-→ output projection + residual epilogue
-→ fused RMSNorm
-→ fused SwiGLU
-→ down projection + residual epilogue
+→ split Q/K/V
+→ 单独 RoPE
+→ transpose
+→ contiguous copy
+→ 再写 KV Cache
+→ Attention
 ```
 
-其中 LoMa-B 的 F1、F2、F3 分别对应这条链里的 Attention 前处理、Norm/激活融合、以及 residual epilogue。
+后者虽然结果相同，但会产生大量额外显存读写。
+
+LoMa-B 的 `QKV split + RoPE + Flash layout` 融合就是这一思想的实例：QKV Linear 的输出被一次 kernel 处理，直接得到 FlashAttention 可使用的 `[B, H, T, D]` 数据。
+
+对 LLM 来说，进一步要关注：
+
+```text
+Q：直接进入 Attention
+K/V：除供当前 Attention 使用外，还要直接写入 KV Cache
+```
+
+因此真正优秀的 LLM 实现通常会尽量把：
+
+```text
+QKV 投影 + RoPE + KV Cache 写入 + layout 转换
+```
+
+安排成最少的 kernel 和最少的中间 Tensor。
+
+这里的核心原则是：
+
+> GPU 上很多时候不是算不够快，而是 Tensor 被反复重排、复制和读回，导致显存带宽成为瓶颈。
+
+---
+
+## 3. 资源缓存与复用：避免每次请求重新“搭台”
+
+推理中有大量资源不会随每次请求改变：
+
+```text
+模型权重
+Attention workspace
+GEMM workspace
+cuDNN execution plan
+临时 activation buffer
+CUDA Graph 静态输入输出 buffer
+```
+
+如果每次请求都重新创建这些对象，就会浪费 CPU 时间、CUDA 内存分配时间，甚至触发同步。
+
+可以按生命周期理解：
+
+| 生命周期 | 应复用的资源 |
+|---|---|
+| 模型生命周期 | 权重、量化权重、常驻 workspace |
+| shape 生命周期 | cuDNN plan、Flash/GEMM 的 shape bucket、临时 buffer |
+| 请求生命周期 | token slot、输出 buffer、KV Cache block |
+| batch 生命周期 | batch metadata、block table、graph 输入槽位 |
+
+LoMa-B 中会缓存 BF16 权重、cuDNN Attention plan、workspace 和输出 buffer；相同 token 数再次执行时可直接复用。
+
+LLM 中最重要、但 LoMa-B 不具备的缓存是：
+
+```text
+KV Cache
+```
+
+它保存已处理 token 的 K/V，使 decode 时不必重新计算历史上下文：
+
+```text
+历史 token
+→ 已经生成 K/V
+→ 保存在 KV Cache
+
+新 token
+→ 只计算新的 Q/K/V
+→ Q 读取历史 KV Cache
+```
+
+因此，对 LLM runtime 而言，资源复用的核心从“复用 workspace”进一步扩展为：
+
+```text
+权重复用
++ workspace 复用
++ KV Cache 生命周期管理
++ paged block 分配与回收
+```
+
+---
+
+## 4. CUDA Graph：减少 CPU 不断发射 kernel 的开销
+
+即使每个 kernel 都足够快，CPU 仍可能成为瓶颈：
+
+```text
+CPU launch QKV
+CPU launch RoPE
+CPU launch Attention
+CPU launch RMSNorm
+CPU launch MLP
+CPU launch sampling
+...
+```
+
+尤其在 LLM decode 阶段，每步只生成少量 token、GPU 单次计算较短，CPU 的 kernel launch 开销会更突出。
+
+CUDA Graph 的方式是：
+
+```text
+第一次：
+固定 shape、buffer 地址和执行路径
+→ capture 整串 GPU kernel
+
+之后：
+更新静态输入 buffer
+→ graph.replay()
+```
+
+即：
+
+```text
+多次 CPU launch
+↓
+一次 replay
+```
+
+LLM 中通常更适合在 decode 使用 CUDA Graph：
+
+| 阶段 | CUDA Graph 价值 |
+|---|---|
+| Prefill | 有价值，但长序列计算本身较重，launch 占比相对较低 |
+| Decode | 很重要；每步计算小、调用频繁，launch 开销占比更高 |
+
+但 CUDA Graph 有硬约束：
+
+```text
+shape 稳定
+batch size 稳定或落入 bucket
+buffer 地址稳定
+控制流稳定
+所选 backend 稳定
+```
+
+所以生产 LLM 不会只维护一张 graph，而常按 bucket 缓存：
+
+```text
+batch = 1 / 2 / 4 / 8 / 16 ...
+KV length = 若干区间
+dtype / backend / 模型配置
+→ 对应不同 CUDA Graph
+```
+
+不能命中 bucket 或请求形状变化太大时，则回退到 eager 路径。
+
+LoMa-B 也采用相同思路：只有 token 数、batch、阈值、剪枝模式和输入类型等条件匹配已捕获图时，才会 replay；否则不强行使用 CUDA Graph。
+
+---
+
+## 四部分的逻辑关系
+
+```text
+请求已被调度为一个 batch
+→ backend dispatch：选 FlashAttention / cuDNN / PagedAttention
+→ layout planner：准备 QKV、KV Cache 和正确 stride
+→ resource cache：取已有 workspace、plan、buffer
+→ stable shape：命中 CUDA Graph 则 replay
+→ 否则 eager 执行
+```
+
+可以把它总结成一句 LLM runtime 的设计原则：
+
+> 先选择最适合当前请求的 kernel，再避免为这个 kernel 做额外搬运，随后复用一切可复用资源；当执行条件稳定时，把整段 GPU 调度固化为 CUDA Graph。
