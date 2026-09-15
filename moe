@@ -1,191 +1,175 @@
-这三个结论构成了一条完整逻辑链：
+定理 3.8 推导的是 speculative decoding 相对于普通自回归解码的期望 walltime 加速比。
 
-\[
-D_{LK}(p,q)
-\longrightarrow
-\beta
-\longrightarrow
-\alpha
-\]
-
-## Corollary 3.4：\(D_{LK}\) 的基本性质
-
-\[
-\boxed{D_{LK}(p,q)\in[0,1]}
-\]
-
-并且：
-
-\[
-D_{LK}(p,q)=D_{LK}(q,p)
-\]
-
-所以它是对称的分布差异度量。
-
-另外：
-
-\[
-\boxed{D_{LK}(p,q)=0\iff p=q}
-\]
-
-即两个分布完全相同时，距离为 0。
-
-以及：
+结论为：
 
 \[
 \boxed{
-D_{LK}(p,q)=1
-\iff
-p,q\text{ 的支撑集不相交}
-}
-\]
-
-“支撑集不相交”指不存在任何 token 同时满足：
-
-\[
-p(x)>0,\qquad q(x)>0
-\]
-
-这些结论可以直接由 Lemma 3.3 得到：
-
-\[
-D_{LK}(p,q)=1-\sum_x\min(p(x),q(x))
-\]
-
-因为重合概率：
-
-\[
-\sum_x\min(p(x),q(x))
-\]
-
-一定在 \([0,1]\) 之间。
-
-- 完全重合：重合量为 1，\(D_{LK}=0\)；
-- 完全不重合：重合量为 0，\(D_{LK}=1\)。
-
----
-
-## Theorem 3.5：接受率与分布距离的关系
-
-定理结论是：
-
-\[
-\boxed{\beta=1-D_{LK}(p,q)}
-\]
-
-其中 \(\beta\) 是在当前前缀下，小模型候选被接受的概率。
-
-小模型先采样：
-
-\[
-x\sim q(x)
-\]
-
-给定候选 \(x\)，接受概率是：
-
-\[
-\min\left(1,\frac{p(x)}{q(x)}\right)
-\]
-
-所以总体接受率为：
-
-\[
-\begin{aligned}
-\beta
-&=\mathbb E_{x\sim q}
-\left[
-\min\left(1,\frac{p(x)}{q(x)}\right)
-\right]\\
-&=\sum_xq(x)
-\min\left(1,\frac{p(x)}{q(x)}\right)\\
-&=\sum_x\min(p(x),q(x))
-\end{aligned}
-\]
-
-根据 Lemma 3.3：
-
-\[
-\sum_x\min(p(x),q(x))
-=1-D_{LK}(p,q)
-\]
-
-因此：
-
-\[
-\boxed{\beta=1-D_{LK}(p,q)}
-\]
-
-含义是：
-
-> 目标模型与小模型的分布越接近，候选接受率越高。
-
----
-
-## Corollary 3.6：平均接受率 \(\alpha\)
-
-由于不同前缀下的 \(p,q\) 不同，\(\beta\) 也会变化。作者定义平均接受率：
-
-\[
-\alpha=E(\beta)
-\]
-
-把 Theorem 3.5 代入：
-
-\[
-\begin{aligned}
-\alpha
-&=E(\beta)\\
-&=E\left[1-D_{LK}(p,q)\right]\\
-&=1-E\left[D_{LK}(p,q)\right]
-\end{aligned}
-\]
-
-因此：
-
-\[
-\boxed{
-\alpha
+\text{Speedup}
 =
-1-E\left[D_{LK}(p,q)\right]
+\frac{1-\alpha^{\gamma+1}}
+{(1-\alpha)(\gamma c+1)}
 }
 \]
 
-也可以写成：
+推导分三步。
+
+## 1. 普通解码的单位 token 耗时
+
+设目标模型 \(M_p\) 生成一个 token 所需时间为：
 
 \[
-\boxed{
-\alpha
-=
-E\left[\sum_x\min(p(x),q(x))\right]
-}
+T
 \]
 
-这里的期望是对实际生成过程中遇到的不同前缀取平均。
-
-## 三者的关系
+因此普通自回归解码的单位 token 成本是：
 
 \[
-\boxed{
+C_{\text{normal}}=T
+\]
+
+## 2. Algorithm 1 每轮的耗时
+
+成本系数定义为：
+
+\[
+c=\frac{T_q}{T_p}
+\]
+
+所以小模型运行一次的时间是：
+
+\[
+T_q=cT
+\]
+
+为了提出 \(\gamma\) 个候选，小模型需要自回归运行 \(\gamma\) 次：
+
+\[
+T_{\text{draft}}=\gamma cT
+\]
+
+目标模型对所有候选进行一次并行验证。论文假设计算资源足够，使这次并行验证耗时约为：
+
+\[
+T_{\text{target}}=T
+\]
+
+所以一轮 Algorithm 1 的总耗时为：
+
+\[
 \begin{aligned}
-\text{Lemma 3.3：}\quad
-&D_{LK}=1-\text{分布重合量}\\[2mm]
-\text{Corollary 3.4：}\quad
-&0\le D_{LK}\le1，并给出两个边界情况\\[2mm]
-\text{Theorem 3.5：}\quad
-&\beta=1-D_{LK}\\[2mm]
-\text{Corollary 3.6：}\quad
-&\alpha=E(\beta)=1-E(D_{LK})
+T_{\text{iteration}}
+&=\gamma cT+T\\
+&=(\gamma c+1)T
 \end{aligned}
+\]
+
+## 3. 每轮平均生成的 token 数
+
+根据 3.1：
+
+\[
+E(N)
+=
+\frac{1-\alpha^{\gamma+1}}{1-\alpha}
+\]
+
+所以 speculative decoding 生成一个 token 的平均时间为：
+
+\[
+\begin{aligned}
+C_{\text{spec}}
+&=
+\frac{\text{每轮耗时}}
+{\text{每轮平均生成 token 数}}\\
+&=
+\frac{(\gamma c+1)T}
+{\dfrac{1-\alpha^{\gamma+1}}{1-\alpha}}\\
+&=
+\frac{(\gamma c+1)(1-\alpha)}
+{1-\alpha^{\gamma+1}}T
+\end{aligned}
+\]
+
+## 4. 计算加速比
+
+加速比定义为：
+
+\[
+\text{Speedup}
+=
+\frac{\text{普通解码单位 token 耗时}}
+{\text{推测解码单位 token 耗时}}
+\]
+
+代入：
+
+\[
+\begin{aligned}
+\text{Speedup}
+&=
+\frac{T}
+{\dfrac{(\gamma c+1)(1-\alpha)}
+{1-\alpha^{\gamma+1}}T}\\
+&=
+\boxed{
+\frac{1-\alpha^{\gamma+1}}
+{(1-\alpha)(\gamma c+1)}
+}
+\end{aligned}
+\]
+
+也可以写成更直观的形式：
+
+\[
+\boxed{
+\text{Speedup}
+=
+\frac{\text{每轮平均生成 token 数}}
+{\text{每轮相对时间成本}}
+=
+\frac{E(N)}{1+\gamma c}
 }
 \]
 
-最终它把“两个模型有多接近”与“speculative decoding 能接受多少候选”联系起来：
+### 数值例子
+
+假设：
 
 \[
-M_q\text{ 越接近 }M_p
-\Rightarrow D_{LK}\text{ 越小}
-\Rightarrow\beta,\alpha\text{ 越大}
-\Rightarrow\text{每轮生成的 token 越多}
+\alpha=0.8,\qquad \gamma=4,\qquad c=0.05
 \]
+
+每轮平均生成：
+
+\[
+E(N)
+=
+\frac{1-0.8^5}{1-0.8}
+=3.3616
+\]
+
+每轮相对时间成本：
+
+\[
+1+\gamma c
+=1+4\times0.05
+=1.2
+\]
+
+所以：
+
+\[
+\text{Speedup}
+=
+\frac{3.3616}{1.2}
+\approx2.80
+\]
+
+即理论上约为普通解码的 \(2.8\) 倍。
+
+该定理依赖两个关键假设：
+
+- 不同位置的候选接受事件近似独立，平均接受率为 \(\alpha\)；
+- 目标模型对 \(\gamma+1\) 个位置的验证可以充分并行，walltime 近似为一次目标模型调用。
 
 来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
