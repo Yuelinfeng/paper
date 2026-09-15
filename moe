@@ -1,94 +1,191 @@
-Lemma 3.3 的公式是：
+这三个结论构成了一条完整逻辑链：
+
+\[
+D_{LK}(p,q)
+\longrightarrow
+\beta
+\longrightarrow
+\alpha
+\]
+
+## Corollary 3.4：\(D_{LK}\) 的基本性质
+
+\[
+\boxed{D_{LK}(p,q)\in[0,1]}
+\]
+
+并且：
+
+\[
+D_{LK}(p,q)=D_{LK}(q,p)
+\]
+
+所以它是对称的分布差异度量。
+
+另外：
+
+\[
+\boxed{D_{LK}(p,q)=0\iff p=q}
+\]
+
+即两个分布完全相同时，距离为 0。
+
+以及：
 
 \[
 \boxed{
-D_{LK}(p,q)=1-\sum_x\min(p(x),q(x))
+D_{LK}(p,q)=1
+\iff
+p,q\text{ 的支撑集不相交}
 }
 \]
 
-其中：
+“支撑集不相交”指不存在任何 token 同时满足：
 
 \[
-D_{LK}(p,q)=\frac12\sum_x|p(x)-q(x)|
+p(x)>0,\qquad q(x)>0
 \]
 
-### 推导
-
-利用恒等式：
-
-\[
-\min(a,b)=\frac{a+b-|a-b|}{2}
-\]
-
-可得：
-
-\[
-\begin{aligned}
-\sum_x\min(p(x),q(x))
-&=\sum_x\frac{p(x)+q(x)-|p(x)-q(x)|}{2}\\
-&=\frac12\left(
-\sum_xp(x)+\sum_xq(x)-\sum_x|p(x)-q(x)|
-\right)
-\end{aligned}
-\]
-
-因为 \(p,q\) 都是概率分布：
-
-\[
-\sum_xp(x)=\sum_xq(x)=1
-\]
-
-所以：
-
-\[
-\begin{aligned}
-\sum_x\min(p(x),q(x))
-&=1-\frac12\sum_x|p(x)-q(x)|\\
-&=1-D_{LK}(p,q)
-\end{aligned}
-\]
-
-移项即得到：
+这些结论可以直接由 Lemma 3.3 得到：
 
 \[
 D_{LK}(p,q)=1-\sum_x\min(p(x),q(x))
 \]
 
-### 直观含义
+因为重合概率：
 
 \[
 \sum_x\min(p(x),q(x))
 \]
 
-表示两个概率分布重合的概率质量，因此：
+一定在 \([0,1]\) 之间。
+
+- 完全重合：重合量为 1，\(D_{LK}=0\)；
+- 完全不重合：重合量为 0，\(D_{LK}=1\)。
+
+---
+
+## Theorem 3.5：接受率与分布距离的关系
+
+定理结论是：
 
 \[
-\boxed{\text{分布差异}=1-\text{分布重合部分}}
+\boxed{\beta=1-D_{LK}(p,q)}
 \]
 
-例如：
+其中 \(\beta\) 是在当前前缀下，小模型候选被接受的概率。
+
+小模型先采样：
 
 \[
-p=(0.7,0.3),\qquad q=(0.4,0.6)
+x\sim q(x)
 \]
 
-重合部分为：
+给定候选 \(x\)，接受概率是：
 
 \[
-\min(0.7,0.4)+\min(0.3,0.6)
-=0.4+0.3=0.7
+\min\left(1,\frac{p(x)}{q(x)}\right)
 \]
 
-所以：
+所以总体接受率为：
 
 \[
-D_{LK}(p,q)=1-0.7=0.3
+\begin{aligned}
+\beta
+&=\mathbb E_{x\sim q}
+\left[
+\min\left(1,\frac{p(x)}{q(x)}\right)
+\right]\\
+&=\sum_xq(x)
+\min\left(1,\frac{p(x)}{q(x)}\right)\\
+&=\sum_x\min(p(x),q(x))
+\end{aligned}
 \]
 
-这个引理随后用于证明接受率：
+根据 Lemma 3.3：
 
 \[
-\beta=\sum_x\min(p(x),q(x))=1-D_{LK}(p,q)
+\sum_x\min(p(x),q(x))
+=1-D_{LK}(p,q)
 \]
 
-即两个模型的分布越接近，候选 token 的接受率越高。
+因此：
+
+\[
+\boxed{\beta=1-D_{LK}(p,q)}
+\]
+
+含义是：
+
+> 目标模型与小模型的分布越接近，候选接受率越高。
+
+---
+
+## Corollary 3.6：平均接受率 \(\alpha\)
+
+由于不同前缀下的 \(p,q\) 不同，\(\beta\) 也会变化。作者定义平均接受率：
+
+\[
+\alpha=E(\beta)
+\]
+
+把 Theorem 3.5 代入：
+
+\[
+\begin{aligned}
+\alpha
+&=E(\beta)\\
+&=E\left[1-D_{LK}(p,q)\right]\\
+&=1-E\left[D_{LK}(p,q)\right]
+\end{aligned}
+\]
+
+因此：
+
+\[
+\boxed{
+\alpha
+=
+1-E\left[D_{LK}(p,q)\right]
+}
+\]
+
+也可以写成：
+
+\[
+\boxed{
+\alpha
+=
+E\left[\sum_x\min(p(x),q(x))\right]
+}
+\]
+
+这里的期望是对实际生成过程中遇到的不同前缀取平均。
+
+## 三者的关系
+
+\[
+\boxed{
+\begin{aligned}
+\text{Lemma 3.3：}\quad
+&D_{LK}=1-\text{分布重合量}\\[2mm]
+\text{Corollary 3.4：}\quad
+&0\le D_{LK}\le1，并给出两个边界情况\\[2mm]
+\text{Theorem 3.5：}\quad
+&\beta=1-D_{LK}\\[2mm]
+\text{Corollary 3.6：}\quad
+&\alpha=E(\beta)=1-E(D_{LK})
+\end{aligned}
+}
+\]
+
+最终它把“两个模型有多接近”与“speculative decoding 能接受多少候选”联系起来：
+
+\[
+M_q\text{ 越接近 }M_p
+\Rightarrow D_{LK}\text{ 越小}
+\Rightarrow\beta,\alpha\text{ 越大}
+\Rightarrow\text{每轮生成的 token 越多}
+\]
+
+来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
