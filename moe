@@ -1,251 +1,125 @@
-从 LLM 推理引擎的角度看，性能不是单靠某个 FlashAttention 或融合 kernel 获得的，而是一条完整执行链的结果：
+论文中的 Speculative Decoding（推测解码）可以概括为：
 
-```text
-先决定用哪种算子实现
-→ 再把数据准备成该实现最适合的布局
-→ 复用已经申请、构建好的资源
-→ 在执行模式稳定时，用 CUDA Graph 降低调度开销
-```
+> 先让“小模型快速起草多个 token”，再让“大模型一次性并行审核，从而减少大模型串行调用次数。
 
-这四部分可以理解为 LLM runtime 的“执行优化层”。:codex-annotation{index="1"}
+论文记号：
 
-```text
-1. Backend dispatch：决定怎么算
-2. Tensor / layout 准备：决定数据怎样摆放
-3. 资源缓存与复用：避免重复准备
-4. CUDA Graph：减少 CPU 发射 kernel 的成本
-```
+- \(M_p\)：目标模型（Target Model），生成质量高，但推理慢。
+- \(M_q\)：近似模型（Draft/Approximation Model），规模较小，速度快。
+- \(p(x_t\mid x_{<t})\)、\(q(x_t\mid x_{<t})\)：两个模型对下一个 token 的概率分布。
+- \(\gamma\)：小模型每轮预先生成的 token 数量。
 
-在完整 LLM 系统中，它们前面还会有请求调度、continuous batching、prefill/decode 分流、KV Cache 管理；这四部分则负责把已确定的 batch 高效地送上 GPU。
+### 传统自回归解码
 
----
+普通解码每次只能生成一个 token：
 
-## 1. Backend dispatch：决定“这次 Attention/GEMM 应该怎么跑”
+\[
+x_1 \rightarrow x_2 \rightarrow x_3 \rightarrow \cdots
+\]
 
-同一个 Attention 公式，有不同实现：
+每生成一个 token，都必须串行运行一次大模型。因此生成 \(N\) 个 token，通常需要大模型连续运行 \(N\) 次。
 
-```text
-FlashAttention
-cuDNN SDPA
-PagedAttention
-decode 专用 kernel
-通用 fallback
-```
+### Speculative Decoding 的一轮流程
 
-它们数学语义相同，但适合的条件不同。LLM runtime 要根据运行状态选择。
+假设 \(\gamma=4\)。
 
-```python
-if phase == "prefill" and dtype in [BF16, FP16]:
-    backend = FlashAttention
+1. 小模型快速起草
 
-elif phase == "decode" and kv_cache_is_paged:
-    backend = PagedAttention
+小模型 \(M_q\) 自回归地产生 4 个候选 token：
 
-elif shape_matches_cudnn_plan:
-    backend = cuDNN_SDPA
+\[
+x_1,x_2,x_3,x_4
+\]
 
-else:
-    backend = fallback
-```
+由于小模型便宜，这部分计算成本较低。
 
-LLM 中最关键的选择维度包括：
+2. 大模型一次性审核
 
-- 阶段：prefill 还是 decode；
-- GPU 架构：SM80、SM89、SM90 等；
-- 精度：BF16、FP8 等；
-- `Q` 的长度、KV Cache 长度、head_dim；
-- Attention 形式：MHA、GQA、MLA；
-- KV Cache 的内存布局：连续还是分页。
+目标模型 \(M_p\) 对下面这些位置的概率分布进行并行计算：
 
-LoMa-B 的对应实现较简单：SM89 的 BF16 route 明确选择 PyTorch FlashAttention；SM80/SM90 使用 cuDNN SDPA。它体现的是同一原则：**不要让同一种算子实现覆盖所有硬件和所有 shape。**
+\[
+p_1,p_2,p_3,p_4,p_5
+\]
 
----
+其中：
 
-## 2. Tensor / layout 准备：让数据以 kernel 最喜欢的形式进入 GPU
+- \(p_1\)：根据原始前缀预测 \(x_1\)
+- \(p_2\)：根据“前缀+\(x_1\)”预测 \(x_2\)
+- \(p_3\)：根据“前缀+\(x_1,x_2\)”预测 \(x_3\)
+- 依此类推
 
-高性能 kernel 往往不是“拿任意 Tensor 都能最快跑”。例如 FlashAttention 希望 Q/K/V 的 dtype、shape、stride 和布局满足要求。
+Transformer 可以在一次前向传播中计算这些位置，因此不需要把大模型串行运行 5 次。
 
-LLM 中理想路径是：
+3. 依次接受候选 token
 
-```text
-hidden states
-→ QKV GEMM
-→ fused RoPE
-→ 直接写为 Attention / KV Cache 所需布局
-→ Attention
-```
+对于小模型生成的候选 \(x_i\)，其接受概率为：
 
-而不是：
+\[
+\min\left(1,\frac{p_i(x_i)}{q_i(x_i)}\right)
+\]
 
-```text
-QKV GEMM
-→ split Q/K/V
-→ 单独 RoPE
-→ transpose
-→ contiguous copy
-→ 再写 KV Cache
-→ Attention
-```
+直观地说：
 
-后者虽然结果相同，但会产生大量额外显存读写。
+- 如果大模型认为该 token 至少和小模型一样合理，就直接接受。
+- 如果小模型过度高估了该 token，就只以 \(p_i(x_i)/q_i(x_i)\) 的概率接受。
 
-LoMa-B 的 `QKV split + RoPE + Flash layout` 融合就是这一思想的实例：QKV Linear 的输出被一次 kernel 处理，直接得到 FlashAttention 可使用的 `[B, H, T, D]` 数据。
+候选必须从左到右连续接受。一旦某个 token 被拒绝，后面的候选也全部丢弃，因为它们建立在错误前缀之上。
 
-对 LLM 来说，进一步要关注：
+4. 补充一个由大模型决定的 token
 
-```text
-Q：直接进入 Attention
-K/V：除供当前 Attention 使用外，还要直接写入 KV Cache
-```
+- 如果某个候选被拒绝，就从修正分布
 
-因此真正优秀的 LLM 实现通常会尽量把：
+\[
+p'(x)=\operatorname{norm}\big(\max(0,p(x)-q(x))\big)
+\]
 
-```text
-QKV 投影 + RoPE + KV Cache 写入 + layout 转换
-```
+重新采样一个 token，替换第一个被拒绝的候选。
 
-安排成最少的 kernel 和最少的中间 Tensor。
+- 如果全部 \(\gamma\) 个候选都被接受，则利用大模型已经算出的 \(p_{\gamma+1}\)，再生成一个额外 token。
 
-这里的核心原则是：
+因此，一轮大模型调用一定会产生至少 1 个 token，最多产生：
 
-> GPU 上很多时候不是算不够快，而是 Tensor 被反复重排、复制和读回，导致显存带宽成为瓶颈。
+\[
+\gamma+1
+\]
 
----
+个 token。
 
-## 3. 资源缓存与复用：避免每次请求重新“搭台”
+### 举例
 
-推理中有大量资源不会随每次请求改变：
+小模型一次起草：
 
-```text
-模型权重
-Attention workspace
-GEMM workspace
-cuDNN execution plan
-临时 activation buffer
-CUDA Graph 静态输入输出 buffer
-```
+> “今天天气非常适合跑步”
 
-如果每次请求都重新创建这些对象，就会浪费 CPU 时间、CUDA 内存分配时间，甚至触发同步。
+假设大模型依次接受：
 
-可以按生命周期理解：
+> “今天” → “天气” → “非常” → “适合”
 
-| 生命周期 | 应复用的资源 |
-|---|---|
-| 模型生命周期 | 权重、量化权重、常驻 workspace |
-| shape 生命周期 | cuDNN plan、Flash/GEMM 的 shape bucket、临时 buffer |
-| 请求生命周期 | token slot、输出 buffer、KV Cache block |
-| batch 生命周期 | batch metadata、block table、graph 输入槽位 |
+但拒绝“跑步”，那么本轮输出可能是：
 
-LoMa-B 中会缓存 BF16 权重、cuDNN Attention plan、workspace 和输出 buffer；相同 token 数再次执行时可直接复用。
+> “今天天气非常适合散步”
 
-LLM 中最重要、但 LoMa-B 不具备的缓存是：
+其中前四个 token 来自小模型，最后一个修正 token 来自大模型的修正分布。
 
-```text
-KV Cache
-```
+### 最关键的性质
 
-它保存已处理 token 的 K/V，使 decode 时不必重新计算历史上下文：
+Speculative Decoding 并不是简单地“相信小模型”。它通过接受概率和修正分布保证：
 
-```text
-历史 token
-→ 已经生成 K/V
-→ 保存在 KV Cache
+\[
+\text{最终输出分布}
+=
+\text{仅使用目标模型时的输出分布}
+\]
 
-新 token
-→ 只计算新的 Q/K/V
-→ Q 读取历史 KV Cache
-```
+所以理论上：
 
-因此，对 LLM runtime 而言，资源复用的核心从“复用 workspace”进一步扩展为：
+- 不改变目标模型的生成结果分布；
+- 不需要重新训练目标模型；
+- 最坏情况下每轮仍然生成一个 token，不会比普通串行解码需要更多的大模型串行轮次；
+- 当小模型与大模型预测接近时，一次大模型调用可以确认多个 token，从而显著降低延迟。
 
-```text
-权重复用
-+ workspace 复用
-+ KV Cache 生命周期管理
-+ paged block 分配与回收
-```
+论文 Figure 1 的例子中，38 个 token 只需要目标模型串行运行 9 次；论文报告在部分 T5-XXL 实验中取得了约 \(2\text{–}3\times\) 的延迟改善。来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
 
----
-
-## 4. CUDA Graph：减少 CPU 不断发射 kernel 的开销
-
-即使每个 kernel 都足够快，CPU 仍可能成为瓶颈：
-
-```text
-CPU launch QKV
-CPU launch RoPE
-CPU launch Attention
-CPU launch RMSNorm
-CPU launch MLP
-CPU launch sampling
-...
-```
-
-尤其在 LLM decode 阶段，每步只生成少量 token、GPU 单次计算较短，CPU 的 kernel launch 开销会更突出。
-
-CUDA Graph 的方式是：
-
-```text
-第一次：
-固定 shape、buffer 地址和执行路径
-→ capture 整串 GPU kernel
-
-之后：
-更新静态输入 buffer
-→ graph.replay()
-```
-
-即：
-
-```text
-多次 CPU launch
-↓
-一次 replay
-```
-
-LLM 中通常更适合在 decode 使用 CUDA Graph：
-
-| 阶段 | CUDA Graph 价值 |
-|---|---|
-| Prefill | 有价值，但长序列计算本身较重，launch 占比相对较低 |
-| Decode | 很重要；每步计算小、调用频繁，launch 开销占比更高 |
-
-但 CUDA Graph 有硬约束：
-
-```text
-shape 稳定
-batch size 稳定或落入 bucket
-buffer 地址稳定
-控制流稳定
-所选 backend 稳定
-```
-
-所以生产 LLM 不会只维护一张 graph，而常按 bucket 缓存：
-
-```text
-batch = 1 / 2 / 4 / 8 / 16 ...
-KV length = 若干区间
-dtype / backend / 模型配置
-→ 对应不同 CUDA Graph
-```
-
-不能命中 bucket 或请求形状变化太大时，则回退到 eager 路径。
-
-LoMa-B 也采用相同思路：只有 token 数、batch、阈值、剪枝模式和输入类型等条件匹配已捕获图时，才会 replay；否则不强行使用 CUDA Graph。
-
----
-
-## 四部分的逻辑关系
-
-```text
-请求已被调度为一个 batch
-→ backend dispatch：选 FlashAttention / cuDNN / PagedAttention
-→ layout planner：准备 QKV、KV Cache 和正确 stride
-→ resource cache：取已有 workspace、plan、buffer
-→ stable shape：命中 CUDA Graph 则 replay
-→ 否则 eager 执行
-```
-
-可以把它总结成一句 LLM runtime 的设计原则：
-
-> 先选择最适合当前请求的 kernel，再避免为这个 kernel 做额外搬运，随后复用一切可复用资源；当执行条件稳定时，把整段 GPU 调度固化为 CUDA Graph。
+- :codex-followup[图解完整流程]{prompt="请用流程图和具体 token 示例进一步解释 speculative decoding"}
+- :codex-followup[推导分布不变性]{prompt="请推导 speculative sampling 为什么能够保证输出分布与目标模型完全相同"}
+- :codex-followup[逐行解析算法]{prompt="请逐行讲解论文中的 Algorithm 1，并解释每个公式"}
