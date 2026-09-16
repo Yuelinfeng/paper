@@ -1,1 +1,289 @@
-https://niessner.github.io/student-topics/project.html?slug=nluetzow_gaussiangpt_specdec
+Section 4 主要验证两个问题：
+
+1. Speculative decoding 在真实硬件上能否获得 walltime 加速？
+2. 不同目标模型、draft model、任务和采样方式下，接受率 \(\alpha\) 有多高？
+
+由于算法保证输出分布不变，作者不需要比较 BLEU、ROUGE 等质量指标，实验重点是速度和接受率。
+
+# 4.1 Empirical Walltime Improvement
+
+## 实验设置
+
+目标模型统一使用：
+
+\[
+M_p=\text{T5-XXL 11B}
+\]
+
+测试两个任务：
+
+- **EnDe**：WMT 英语到德语翻译；
+- **CNN/DM**：新闻文本摘要。
+
+Draft model 使用同系列的三个现成模型：
+
+| Draft model | 参数量 |
+|---|---:|
+| T5-small | 77M |
+| T5-base | 250M |
+| T5-large | 800M |
+
+实验环境：
+
+- 单张 TPU-v4；
+- batch size 为 1；
+- 与优化过的 T5X 普通解码实现比较；
+- 使用现有 checkpoint，不额外训练 draft model。
+
+测试两种采样设置：
+
+- \(T=0\)：argmax/greedy decoding；
+- \(T=1\)：标准随机采样。
+
+表中的字段含义是：
+
+- `TEMP`：温度设置；
+- \(\gamma\)：每轮 draft token 数；
+- \(\alpha\)：平均接受率；
+- `SPEED`：相对于普通 T5X 解码的 walltime 加速倍数。
+
+## 翻译任务结果
+
+### \(T=0\)：贪心解码
+
+| Draft model | \(\gamma\) | \(\alpha\) | 加速 |
+|---|---:|---:|---:|
+| T5-small | 7 | 0.75 | **3.4×** |
+| T5-base | 7 | 0.80 | 2.8× |
+| T5-large | 7 | 0.82 | 1.7× |
+
+随着 draft model 增大：
+
+\[
+\alpha:0.75\rightarrow0.80\rightarrow0.82
+\]
+
+接受率确实提高了，但速度反而下降：
+
+\[
+3.4\times\rightarrow2.8\times\rightarrow1.7\times
+\]
+
+因为更大的 draft model 虽然预测更准，却具有更高的成本 \(c\)。
+
+### \(T=1\)：随机采样
+
+| Draft model | \(\gamma\) | \(\alpha\) | 加速 |
+|---|---:|---:|---:|
+| T5-small | 7 | 0.62 | **2.6×** |
+| T5-base | 5 | 0.68 | 2.4× |
+| T5-large | 3 | 0.71 | 1.4× |
+
+随机采样下接受率降低，整体加速也低于贪心解码。
+
+## 摘要任务结果
+
+### \(T=0\)
+
+| Draft model | \(\gamma\) | \(\alpha\) | 加速 |
+|---|---:|---:|---:|
+| T5-small | 5 | 0.65 | **3.1×** |
+| T5-base | 5 | 0.73 | 3.0× |
+| T5-large | 3 | 0.74 | 2.2× |
+
+### \(T=1\)
+
+| Draft model | \(\gamma\) | \(\alpha\) | 加速 |
+|---|---:|---:|---:|
+| T5-small | 5 | 0.53 | **2.3×** |
+| T5-base | 3 | 0.55 | 2.2× |
+| T5-large | 3 | 0.56 | 1.7× |
+
+摘要任务的接受率整体低于翻译任务，说明摘要生成更加开放，draft model 与目标模型更容易产生不同选择。
+
+## 4.1 的主要结论
+
+### 结论一：最准确的 draft model 不一定最快
+
+T5-large 的 \(\alpha\) 最高，但加速通常最低。真正决定速度的是：
+
+\[
+\text{Speedup}
+=
+\frac{1-\alpha^{\gamma+1}}
+{(1-\alpha)(1+\gamma c)}
+\]
+
+因此需要同时考虑：
+
+- \(\alpha\)：预测准确度带来的收益；
+- \(c\)：运行 draft model 的成本。
+
+T5-small 在两者之间取得了最佳平衡。
+
+### 结论二：贪心解码通常更容易加速
+
+在 \(T=0\) 时，调整后的分布非常尖锐，通常只有 argmax token 的概率为 1。如果两个模型选择相同的 argmax，候选就能直接接受。
+
+随机采样的分布更分散，小模型与目标模型的采样结果更容易不同，所以 \(\alpha\) 较低。
+
+实验中：
+
+- 翻译：\(3.4\times\)（\(T=0\)）和 \(2.6\times\)（\(T=1\)）；
+- 摘要：\(3.1\times\)（\(T=0\)）和 \(2.3\times\)（\(T=1\)）。
+
+### 结论三：实测结果总体符合理论
+
+作者在附录 A.3 中用实测的 \(\alpha,c,\gamma\) 代入定理 3.8，理论值与实测速度总体接近。
+
+差异主要来自：
+
+- 实现和基线的优化程度不同；
+- 不同位置的 \(\beta\) 并非真正独立同分布；
+- 硬件并行并不完全符合理论假设。
+
+# 4.2 Empirical \(\alpha\) Values
+
+这一节不再完整实现 walltime 测试，而是测量各种组合下的平均接受率：
+
+\[
+\alpha=E(\beta)
+\]
+
+每组设置使用目标模型生成的 10,000 个 token 进行估计。
+
+## 第一组：GPT-like 97M
+
+任务：
+
+- LM1B 上的无条件文本生成。
+
+目标模型：
+
+\[
+M_p=\text{GPT-like 97M}
+\]
+
+Draft model：
+
+- unigram；
+- bigram；
+- GPT-like 6M。
+
+主要结果：
+
+| Draft model | \(T=0\) 的 \(\alpha\) | \(T=1\) 的 \(\alpha\) |
+|---|---:|---:|
+| Unigram | 0.03 | 0.03 |
+| Bigram | 0.05 | 0.05 |
+| GPT-like 6M | 0.88 | 0.89 |
+
+6M 参数的小型 Transformer 与 97M 目标模型非常接近，接受率约为 0.9。Unigram、bigram 成本极低，但在开放式生成上的接受率很低。
+
+## 第二组：T5-XXL 11B
+
+测试任务仍然是：
+
+- 英德翻译；
+- CNN/DM 摘要。
+
+结果显示：
+
+- T5-small、base、large 的 \(\alpha\) 大致为 \(0.5\sim0.82\)；
+- draft model 越大，\(\alpha\) 越高；
+- 翻译任务的 \(\alpha\) 通常高于摘要任务；
+- \(T=0\) 的 \(\alpha\) 通常高于 \(T=1\)。
+
+值得注意的是，简单 bigram 在英德翻译上也得到：
+
+\[
+\alpha\approx0.2
+\]
+
+因为 bigram 基本是查表，可认为：
+
+\[
+c\approx0
+\]
+
+取 \(\gamma=3\) 时仍能获得约 \(1.25\times\) 加速。
+
+这说明：
+
+> Draft model 不一定必须是神经网络；只要成本足够低，即使接受率不高，也可能有收益。
+
+## 第三组：LaMDA 137B
+
+任务：
+
+- 对话生成。
+
+目标模型：
+
+\[
+M_p=\text{LaMDA 137B}
+\]
+
+Draft model：
+
+- LaMDA 100M；
+- LaMDA 2B；
+- LaMDA 8B。
+
+结果：
+
+| Draft model | \(T=0\) 的 \(\alpha\) | \(T=1\) 的 \(\alpha\) |
+|---|---:|---:|
+| LaMDA 100M | 0.61 | 0.57 |
+| LaMDA 2B | 0.71 | 0.71 |
+| LaMDA 8B | 0.75 | 0.74 |
+
+Draft model 越大，接受率越高。但这里作者只测量了 \(\alpha\)，没有报告完整的 LaMDA walltime 加速。
+
+# Section 4 的整体结论
+
+实验支持了以下观点：
+
+1. **Speculative decoding 可以获得真实 walltime 加速。**  
+   在 T5-XXL 上达到约 \(2\sim3\times\)，最佳结果为 \(3.4\times\)。
+
+2. **Draft model 不是越大越好。**  
+   更大模型提高 \(\alpha\)，但也提高 \(c\)。T5-small 比 T5-base、T5-large 更快。
+
+3. **任务决定接受率。**  
+   确定性较强的翻译任务比开放式摘要更容易获得较高接受率。
+
+4. **采样方式影响接受率。**  
+   贪心解码的分布更尖锐，通常比随机采样获得更高的 \(\alpha\) 和加速比。
+
+5. **简单模型也可能有价值。**  
+   n-gram 即使接受率较低，只要成本接近零，也可能提供一定加速。
+
+6. **理论公式具有一定预测能力。**  
+   定理 3.8 根据 \(\alpha,c,\gamma\) 预测的加速比与实际结果总体吻合。
+
+最重要的实验结论可以概括成：
+
+\[
+\boxed{
+\text{最佳 draft model}
+\neq
+\text{接受率最高的模型}
+}
+\]
+
+而是：
+
+\[
+\boxed{
+\text{能够在较高 }\alpha
+\text{ 和较低 }c
+\text{ 之间取得最佳平衡的模型}
+}
+\]
+
+来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
+
+- :codex-followup[逐行解读Table 2]{prompt="请逐行解释Table 2，并说明为什么不同配置选择不同gamma"}
+- :codex-followup[深入分析Table 3]{prompt="请详细分析Table 3中不同模型、任务和温度对alpha的影响"}
+- :codex-followup[对照理论与实测]{prompt="请结合附录A.3复算理论加速比并与Section 4实测结果比较"}
