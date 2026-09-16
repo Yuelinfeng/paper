@@ -1,174 +1,221 @@
-定理 3.11 分析的不是 walltime，而是：
+这部分需要把 Figure 3 与 Table 1/Figure 4 分开看：
 
-> Speculative decoding 相对于普通解码，平均会执行多少倍的算术运算。
+- Figure 3：研究现实中如何选择最优 \(\gamma\)，所以使用不同的 \(c>0\)。
+- Table 1、Figure 4：研究算法本身的“速度—运算量”权衡，所以暂时假设 \(c=\hat c=0\)。
 
-结论是：
+## 一、为什么 Table 1 和 Figure 4 假设 \(c=\hat c=0\)？
+
+两个参数含义不同：
+
+\[
+c=\frac{\text{小模型单步耗时}}{\text{目标模型单步耗时}}
+\]
+
+\[
+\hat c=\frac{\text{小模型单步运算量}}{\text{目标模型单步运算量}}
+\]
+
+令：
+
+\[
+c=\hat c=0
+\]
+
+表示假设草稿模型 \(M_q\) 的时间和运算成本可以忽略。
+
+这不是说真实的小模型一定没有成本，而是为了排除小模型自身的影响，单独观察：
+
+- \(\alpha\)：候选接受率；
+- \(\gamma\)：候选数量；
+
+如何影响速度和目标模型的无效计算。
+
+这种假设也对应 n-gram、查表或简单启发式模型等成本近似为零的草稿模型。
+
+### 公式会变得非常清晰
+
+定理 3.8 的加速比是：
+
+\[
+S=
+\frac{1-\alpha^{\gamma+1}}
+{(1-\alpha)(1+\gamma c)}
+\]
+
+令 \(c=0\)：
 
 \[
 \boxed{
-\text{Operation Increase}
-=
-\frac{(1-\alpha)(\gamma\hat c+\gamma+1)}
-{1-\alpha^{\gamma+1}}
-}
-\]
-
-其中：
-
-- \(\alpha\)：平均接受率；
-- \(\gamma\)：每轮草稿 token 数；
-- \(\hat c\)：小模型生成一个 token 的运算量与目标模型生成一个 token 的运算量之比。
-
-## 1. 定义普通解码的运算量
-
-设目标模型生成一个 token 所需的算术运算量为：
-
-\[
-\hat T
-\]
-
-那么普通自回归解码每生成一个 token 的运算量就是：
-
-\[
-C_{\text{normal}}=\hat T
-\]
-
-Definition 3.10 定义：
-
-\[
-\hat c=
-\frac{\text{小模型单 token 运算量}}
-{\text{目标模型单 token 运算量}}
-\]
-
-因此，小模型生成一个 token 的运算量为：
-
-\[
-\hat c\hat T
-\]
-
-注意：
-
-- \(c\) 是运行时间之比；
-- \(\hat c\) 是算术运算量之比。
-
-二者不一定相等。
-
-## 2. 一轮 Algorithm 1 的运算量
-
-### 小模型部分
-
-小模型串行生成 \(\gamma\) 个草稿 token，因此运算量为：
-
-\[
-C_q=\gamma\hat c\hat T
-\]
-
-### 目标模型部分
-
-目标模型需要计算：
-
-\[
-p_1,p_2,\ldots,p_{\gamma+1}
-\]
-
-虽然这些位置可以并行计算，所以 walltime 可以近似一次调用，但每个位置的算术运算依然真实存在。
-
-目标模型部分的总运算量为：
-
-\[
-C_p=(\gamma+1)\hat T
-\]
-
-因此，一轮 Algorithm 1 的总运算量为：
-
-\[
-\begin{aligned}
-C_{\text{iteration}}
-&=C_q+C_p\\
-&=\gamma\hat c\hat T+(\gamma+1)\hat T\\
-&=(\gamma\hat c+\gamma+1)\hat T
-\end{aligned}
-\]
-
-## 3. 一轮平均生成多少 token？
-
-根据 3.1：
-
-\[
-E(N)
-=
+S=
 \frac{1-\alpha^{\gamma+1}}{1-\alpha}
+=E(N)
+}
 \]
 
-所以 speculative decoding 平均生成一个 token 的运算量为：
+即加速比直接等于每轮平均生成的 token 数。
+
+定理 3.11 的运算量增加系数是：
 
 \[
-\begin{aligned}
-C_{\text{spec/token}}
-&=
-\frac{C_{\text{iteration}}}{E(N)}\\
-&=
-\frac{(\gamma\hat c+\gamma+1)\hat T}
-{\dfrac{1-\alpha^{\gamma+1}}{1-\alpha}}\\
-&=
-\frac{(1-\alpha)(\gamma\hat c+\gamma+1)}
-{1-\alpha^{\gamma+1}}\hat T
-\end{aligned}
-\]
-
-## 4. 与普通解码比较
-
-普通解码每个 token 的运算量是 \(\hat T\)，所以运算量增加系数为：
-
-\[
-\begin{aligned}
-\frac{C_{\text{spec/token}}}{C_{\text{normal}}}
-&=
-\frac{
-\dfrac{(1-\alpha)(\gamma\hat c+\gamma+1)}
-{1-\alpha^{\gamma+1}}\hat T
-}{\hat T}\\
-&=
-\boxed{
+O=
 \frac{(1-\alpha)(\gamma\hat c+\gamma+1)}
 {1-\alpha^{\gamma+1}}
+\]
+
+令 \(\hat c=0\)：
+
+\[
+\boxed{
+O=
+\frac{(1-\alpha)(\gamma+1)}
+{1-\alpha^{\gamma+1}}
+=
+\frac{\gamma+1}{E(N)}
 }
+\]
+
+虽然忽略了小模型运算量，目标模型仍计算了 \(\gamma+1\) 个位置。因此，如果候选被拒绝，仍会有目标模型计算被浪费。
+
+## 二、Table 1 怎么看？
+
+例如表中的：
+
+\[
+\alpha=0.8,\qquad\gamma=5
+\]
+
+每轮平均生成：
+
+\[
+E(N)=
+\frac{1-0.8^6}{1-0.8}
+\approx3.69
+\]
+
+因为 \(c=0\)，所以速度提升为：
+
+\[
+S=3.69\times
+\]
+
+目标模型每轮实际计算了：
+
+\[
+\gamma+1=6
+\]
+
+个位置，但平均只得到 \(3.69\) 个有效 token，所以运算量增加系数为：
+
+\[
+O=\frac6{3.69}\approx1.63\times
+\]
+
+这说明：
+
+> 通过并行计算获得了 \(3.69\times\) 的速度，但执行了普通解码约 \(1.63\times\) 的算术运算。
+
+## 三、Figure 4 怎么看？
+
+Figure 4 的横轴是平均接受率 \(\alpha\)，不同颜色表示不同的 \(\gamma\)。
+
+- 实线 `Speed`：walltime 加速比；
+- 虚线 `Ops`：总算术运算量增加倍数。
+
+### 随着 \(\alpha\) 增大
+
+实线上升，因为更多候选被接受，每轮产生更多 token。
+
+虚线下降，因为更少的目标模型计算被丢弃。
+
+因此高接受率同时意味着：
+
+\[
+\text{速度更快，而且计算浪费更少}
+\]
+
+### 随着 \(\gamma\) 增大
+
+潜在加速比提高，因为一轮最多可以生成 \(\gamma+1\) 个 token。
+
+但是在 \(\alpha\) 较低时，大 \(\gamma\) 会产生大量浪费。例如前几个 token 就被拒绝，后面位置虽然已经计算，却不能使用。
+
+因此 Figure 4 展示的核心权衡是：
+
+\[
+\boxed{
+\gamma\text{ 大}
+\Rightarrow
+\text{潜在速度更高，但低接受率时浪费更多}
+}
+\]
+
+## 四、Figure 3 怎么看？
+
+Figure 3 用于选择能够最大化 walltime 加速比的 \(\gamma\)：
+
+\[
+\boxed{
+\gamma^*
+=
+\arg\max_{\gamma\in\mathbb Z^+}
+\frac{1-\alpha^{\gamma+1}}
+{(1-\alpha)(1+\gamma c)}
+}
+\]
+
+图中：
+
+- 横轴：平均接受率 \(\alpha\)；
+- 纵轴：最优候选数 \(\gamma^*\)；
+- 不同曲线：不同的小模型成本 \(c\)。
+
+### 规律一：\(\alpha\) 越高，最优 \(\gamma\) 越大
+
+如果候选很容易被接受，多生成一些候选通常是有价值的：
+
+\[
+\alpha\uparrow\quad\Rightarrow\quad\gamma^*\uparrow
+\]
+
+例如当 \(\alpha=0.8\) 时：
+
+- \(c=0.01\)：最优 \(\gamma\) 约为 14；
+- \(c=0.05\)：最优 \(\gamma\) 约为 8；
+- \(c=0.1\)：最优 \(\gamma\) 约为 6。
+
+### 规律二：\(c\) 越高，最优 \(\gamma\) 越小
+
+小模型生成每个候选都需要成本。如果 \(M_q\) 较慢，生成太多草稿 token 会抵消加速收益：
+
+\[
+c\uparrow\quad\Rightarrow\quad\gamma^*\downarrow
+\]
+
+反过来，如果小模型几乎没有成本，就可以选择更大的 \(\gamma\)。
+
+### 为什么曲线呈阶梯状？
+
+因为：
+
+\[
+\gamma\in\{1,2,3,\ldots\}
+\]
+
+只能取整数。随着 \(\alpha\) 连续变化，最优值会从 5 突然跳到 6，而不会出现 \(5.4\)，所以图线呈阶梯形。
+
+## 三张图表的整体关系
+
+\[
+\boxed{
+\begin{aligned}
+\text{Figure 3：}&\quad
+给定真实的 }\alpha,c\text{，选择速度最优的 }\gamma\\
+\text{Table 1：}&\quad
+列出若干 }\alpha,\gamma\text{ 组合的具体数值}\\
+\text{Figure 4：}&\quad
+展示速度提升与总运算量增加之间的权衡
 \end{aligned}
+}
 \]
 
-这就是定理 3.11。
-
-## 为什么加速了，运算量反而可能增加？
-
-关键区别是“并行时间”和“总计算量”：
-
-- 定理 3.8 计算 walltime：\(\gamma+1\) 个位置并行，因此目标模型时间近似记为 \(T\)；
-- 定理 3.11 计算总运算量：即使并行执行，\(\gamma+1\) 个位置仍然分别做了计算，因此记为 \((\gamma+1)\hat T\)。
-
-如果某个草稿 token 被拒绝，其后所有位置的目标模型计算都会被丢弃。这些计算缩短了并行延迟，但没有产生有效 token，因而增加总运算量。
-
-例如：
-
-\[
-\alpha=0.8,\qquad\gamma=4,\qquad\hat c=0.05
-\]
-
-运算量增加系数为：
-
-\[
-\frac{(1-0.8)(4\times0.05+4+1)}
-{1-0.8^5}
-\approx1.55
-\]
-
-也就是说：
-
-- 总算术运算量约增加到普通解码的 \(1.55\) 倍；
-- 但由于这些运算高度并行，walltime 仍然可能明显下降。
-
-因此 speculative decoding 本质上是：
-
-\[
-\boxed{\text{用更多并行计算量，换取更少的串行等待时间}}
-\]
+需要注意，Figure 3 只以 walltime 最大化为目标。如果还需要限制显存、能耗或总算力，实际选择的 \(\gamma\) 可能小于图中的最优值。
