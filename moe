@@ -1,11 +1,167 @@
-然后算法读取：
+附录 A.1 要证明：
+
+> 对任意两个概率分布 \(p\) 和 \(q\)，Speculative Sampling 最终输出的 token 仍严格服从目标分布 \(p\)。
+
+设：
+
+- \(x'\sim q(x)\)：小模型提出的候选；
+- 候选接受概率为  
+  \[
+  \min\left(1,\frac{p(x')}{q(x')}\right);
+  \]
+- \(\beta\)：候选的总体接受率；
+- \(p'(x)\)：拒绝候选后使用的修正分布。
+
+### 1. 计算总体接受率 \(\beta\)
+
+候选为 \(x\) 并被接受的概率是：
+
 \[
-p_1(x_1),p_2(x_2),p_3(x_3),p_4(x_4)
-\]并分别与：
-\[
-q_1(x_1),q_2(x_2),q_3(x_3),q_4(x_4)
-\]比较，执行接受检验：
-\[
-r_i\le
-\min\left(1,\frac{p_i(x_i)}{q_i(x_i)}\right)
+q(x)\min\left(1,\frac{p(x)}{q(x)}\right)
+=\min(q(x),p(x))
 \]
+
+对所有 token 求和：
+
+\[
+\beta
+=\sum_x\min(p(x),q(x))
+\]
+
+因此，总拒绝概率为：
+
+\[
+1-\beta
+\]
+
+### 2. 写出修正分布
+
+论文定义：
+
+\[
+p'(x)
+=
+\operatorname{norm}\big(\max(0,p(x)-q(x))\big)
+\]
+
+注意：
+
+\[
+\max(0,p(x)-q(x))
+=
+p(x)-\min(p(x),q(x))
+\]
+
+因此：
+
+\[
+p'(x)
+=
+\frac{p(x)-\min(p(x),q(x))}
+{\sum_y[p(y)-\min(p(y),q(y))]}
+\]
+
+分母为：
+
+\[
+\begin{aligned}
+\sum_y[p(y)-\min(p(y),q(y))]
+&=\sum_y p(y)-\sum_y\min(p(y),q(y))\\
+&=1-\beta
+\end{aligned}
+\]
+
+所以：
+
+\[
+p'(x)=
+\frac{p(x)-\min(p(x),q(x))}
+{1-\beta}
+\]
+
+### 3. 固定一个 token \(x_0\)
+
+要证明最终结果服从 \(p\)，只需证明最终输出 \(x_0\) 的概率恰好为 \(p(x_0)\)。
+
+\(x_0\) 可以通过两条互斥路径输出：
+
+\[
+P(x=x_0)
+=
+P(\text{接受候选且输出 }x_0)
++
+P(\text{拒绝候选后修正为 }x_0)
+\]
+
+### 4. 路径一：接受小模型候选
+
+小模型提出 \(x_0\) 的概率是 \(q(x_0)\)，接受概率是：
+
+\[
+\min\left(1,\frac{p(x_0)}{q(x_0)}\right)
+\]
+
+因此：
+
+\[
+\begin{aligned}
+P(\text{接受且输出 }x_0)
+&=q(x_0)\min\left(1,\frac{p(x_0)}{q(x_0)}\right)\\
+&=\min(q(x_0),p(x_0))
+\end{aligned}
+\]
+
+这部分对应 \(p\) 和 \(q\) 的重合概率。
+
+### 5. 路径二：拒绝后修正
+
+发生拒绝的概率是 \(1-\beta\)。拒绝后，从 \(p'\) 中采到 \(x_0\) 的概率是 \(p'(x_0)\)。
+
+所以：
+
+\[
+\begin{aligned}
+P(\text{拒绝后输出 }x_0)
+&=(1-\beta)p'(x_0)\\
+&=(1-\beta)
+\frac{p(x_0)-\min(p(x_0),q(x_0))}
+{1-\beta}\\
+&=p(x_0)-\min(p(x_0),q(x_0))
+\end{aligned}
+\]
+
+这部分正好补上小模型相对于目标模型缺少的概率。
+
+### 6. 两条路径相加
+
+\[
+\begin{aligned}
+P(x=x_0)
+&=\min(p(x_0),q(x_0))\\
+&\quad+p(x_0)-\min(p(x_0),q(x_0))\\
+&=p(x_0)
+\end{aligned}
+\]
+
+由于这个结论对任意 \(x_0\) 都成立，所以：
+
+\[
+\boxed{x\sim p(x)}
+\]
+
+这就证明了 Speculative Sampling 与直接从目标模型 \(p\) 采样具有完全相同的输出分布。
+
+直观地看：
+
+\[
+\underbrace{\min(p,q)}_{\text{小模型负责的重合部分}}
++
+\underbrace{p-\min(p,q)}_{\text{拒绝后的补偿部分}}
+=p
+\]
+
+小模型只负责两个分布重合的部分；目标模型通过修正分布补齐其余部分，因此既能利用小模型加速，又不会改变目标分布。若 \(p=q\)，则 \(\beta=1\)，候选永远被接受，修正分布根本不会被使用。来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
+
+- :codex-followup[用图形解释证明]{prompt="请用概率面积图直观展示附录A.1中 p、q、min(p,q) 和修正分布的关系"}
+- :codex-followup[证明多token正确性]{prompt="请进一步说明单token证明如何扩展到多token speculative decoding"}
+- :codex-followup[解释接受率公式]{prompt="请解释接受率 beta 与 p、q 的总变差距离之间的关系"}
