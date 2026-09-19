@@ -40,3 +40,41 @@ C++17 · CUDA · TensorRT · CUTLASS · FlashAttention · Nsight Systems
 - 建立 Tensor 误差、Match 一致性、Pose AUC 与端到端耗时四级门禁；单 Pair 推理延迟约 **2.0 ms**，长序列批处理 **33,926 个 Pair 总耗时 62.69 s**，稳态吞吐达到 **541 Pairs/s**（摊销约 **1.85 ms/Pair**）；固定回归集 Match 输出一致率 **100%**，Pose AUC 变化控制在 **1 个百分点以内**。
 
 **技术探索：** 借鉴 LLM 低精度推理技术，基于 FlashAttention v2 与 CUTLASS 探索 E4M3 FP8 Attention/GEMM，设计静态 PTQ、FP32 在线 Softmax 与跨层连续 FP8 数据流，减少量化转换及 Kernel Launch 开销。
+
+以面试官视角复核后，主要做了三点调整：突出 CFM 主线、分开生产方案与技术预研、删除容易引起指标口径追问的冗余数据。
+
+
+
+
+
+这版明显更好。站在面试官视角，前四条已经形成清晰主线：
+
+```text
+调度建模 → 异步执行 → 缓存管理 → 性能与正确性
+```
+
+CFM 占据主要篇幅，Matcher 成为补充能力，比例合理。还需要修正四点：
+
+- 之前写的是 FP16，现在改成 BF16，必须确认真实生产精度，全文保持一致。
+- Host 预取不由 CUDA Event 串联，应区分 CPU 预取队列与 GPU Stream/Event。
+- 高低水位控制的是 Resident Physical Slots，而非“逻辑活跃 Slot”。
+- FlashAttention 出现在技术预研中，应补回技术栈；技术预研最好与生产优化单独表述。
+
+推荐定稿：
+
+## 实习经历
+
+### `[公司名称]`｜GPU 推理优化实习生
+
+**`[部门/团队]`｜2026.07–2026.08**  
+C++17 · CUDA · TensorRT · CUTLASS · FlashAttention · OpenMVG · Python · NVML · Nsight Systems
+
+负责大规模特征提取与匹配（CFM）链路的 CPU/GPU 异构调度、GPU 特征缓存管理与稳定性建设，并参与 LoMa Matcher BF16 生产推理优化及 FP8 技术预研。
+
+- **依赖感知调度：** 针对长序列全量特征常驻导致显存随任务规模增长、特征提取与匹配阶段串行的问题，将 CFM 抽象为“Pair 请求—共享 View 特征—Feature Slab”调度系统；基于共视图设计 BFS/RCM/Min-Frontier 多候选拓扑规划，并通过 Pair-Ready 在线组批消除阶段屏障。
+- **异步流水执行：** 使用 Persistent Host Prefetch 构建有界 CPU 预取队列，并通过 CUDA Stream/Event 串联 Decode/Preprocess、特征推理、Matcher 与结果回收；利用有界 In-flight Ring 控制并发任务数量，实现数据准备、GPU 计算与状态回收的流水重叠。
+- **有界显存管理：** 设计固定容量 Feature Slab 与逻辑—物理 Slot 映射，通过引用计数、Generation 校验及 Completion Callback 管理特征生命周期；根据 GPU Resident Slots 的高低水位实施背压，实现缓存安全复用并避免生产者过度领先。
+- **性能与可靠性：** 在 **10,589 Views、203,509 Pairs** 场景中，将进程峰值显存由 **32.82 GiB 降至 14.51 GiB（-55.8%）**，CFM 耗时由 **1,075.52 s 降至 838.12 s（-22.1%，1.28×）**；建立 NVML 监控、Watchdog 与 Fail-Closed 门禁，保证 Pair Coverage **100%**、Missing/Duplicate **0/0**，无 View 重提取和 Descriptor Spill，五次冷启动 CV 为 **0.185%**。
+- **Matcher 推理优化：** 优化 LoMa-B BF16 生产链路，通过 Attention Batch 合并、Paired GEMM、算子融合、CUDA Graph 及 **2048→1024** 动态 Token Pruning，将单 Pair 延迟优化至约 **2.0 ms**。
+
+**技术预研：** 借鉴 LLM 低精度推理技术，基于 FlashAttention v2 与 CUTLASS 探索 E4M3 FP8 Attention/GEMM、FP32 在线 Softmax 及跨层连续 FP8 数据流。
