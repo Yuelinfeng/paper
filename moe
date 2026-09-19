@@ -1,167 +1,608 @@
-附录 A.1 要证明：
+# 以 vLLM 视角理解 CFM 的调度策略
 
-> 对任意两个概率分布 \(p\) 和 \(q\)，Speculative Sampling 最终输出的 token 仍严格服从目标分布 \(p\)。
+CFM 调度表面上是在安排“先提取哪些图像、再匹配哪些图像对”，其本质却与 vLLM 很相似：
+
+> 在有限 GPU 计算和缓存预算下，持续选择已经满足依赖的任务执行，并根据完成反馈及时回收共享资源。
+
+区别在于，vLLM 面对的是请求与 KV Cache，CFM 面对的是 pair、view feature 和共视图依赖。
+
+---
+
+## 一、vLLM 中的调度问题
+
+vLLM 服务多个长度和执行阶段不同的请求。调度器需要同时处理三个问题。
+
+### 1. 请求何时可以执行
+
+LLM 请求大致经历：
+
+```text
+Waiting
+→ Prefill
+→ Decode
+→ Finished
+```
+
+请求只有在满足以下条件时才能进入本轮执行：
+
+- 前置状态已经完成；
+- 有足够的计算预算；
+- 有足够的 KV Cache；
+- 当前 batch 仍有容量。
+
+因此，调度不是简单的 FIFO，而是受状态与资源约束的 admission control。
+
+### 2. 如何形成执行批次
+
+如果等待一批请求全部完成 Prefill，再统一进入 Decode，会产生明显的阶段屏障。vLLM 采用 continuous batching：
+
+```text
+请求完成或新请求到达
+→ 更新系统状态
+→ 重新选择当前可运行请求
+→ 动态形成下一批执行
+```
+
+批次成员不需要同时到达，也不需要同时结束。只要某个请求满足执行条件，就可以在后续调度轮次中加入。
+
+### 3. 如何管理 KV Cache
+
+KV Cache 既是请求继续执行的必要状态，也是 GPU 显存中的主要受限资源。调度器必须知道：
+
+- 哪些 block 已被分配；
+- 哪些请求仍在引用这些 block；
+- 新任务需要多少 block；
+- 哪些 block 已经可以释放；
+- 资源不足时应等待、抢占还是重计算。
+
+所以，vLLM 的调度核心不是“请求排序”，而是：
+
+> 请求状态、执行预算和缓存生命周期的联合管理。
+
+---
+
+## 二、抽象出的通用调度思想
+
+把具体的 LLM 请求去掉，可以得到一个通用模型。
 
 设：
 
-- \(x'\sim q(x)\)：小模型提出的候选；
-- 候选接受概率为  
-  \[
-  \min\left(1,\frac{p(x')}{q(x')}\right);
-  \]
-- \(\beta\)：候选的总体接受率；
-- \(p'(x)\)：拒绝候选后使用的修正分布。
+- \(T\) 为待执行任务；
+- \(R\) 为有限资源；
+- \(D(t)\) 为任务 \(t\) 所依赖的资源集合；
+- \(C(r)\) 为仍会消费资源 \(r\) 的任务集合。
 
-### 1. 计算总体接受率 \(\beta\)
+任务就绪条件为：
 
-候选为 \(x\) 并被接受的概率是：
+```text
+Ready(t)
+= 所有前置依赖已完成
+&& D(t) 中的资源全部 resident
+&& 执行预算允许
+```
 
-\[
-q(x)\min\left(1,\frac{p(x)}{q(x)}\right)
-=\min(q(x),p(x))
-\]
+资源释放条件为：
 
-对所有 token 求和：
+```text
+Reclaimable(r)
+= C(r) 中所有任务已经完成
+&& 不存在 in-flight 执行仍引用 r
+```
 
-\[
-\beta
-=\sum_x\min(p(x),q(x))
-\]
+调度器每一轮所做的事情可以概括为：
 
-因此，总拒绝概率为：
+```text
+接收完成事件
+→ 更新任务状态
+→ 回收无引用资源
+→ 发现新的 ready 任务
+→ 在预算内形成执行批次
+→ 提交执行
+→ 根据资源压力控制生产速度
+```
 
-\[
-1-\beta
-\]
+由此可以抽象出六项通用原则。
 
-### 2. 写出修正分布
+### 状态驱动，而非固定阶段驱动
 
-论文定义：
+任务不必等待整个阶段结束，只要局部依赖已经满足，就可以继续推进。
 
-\[
-p'(x)
-=
-\operatorname{norm}\big(\max(0,p(x)-q(x))\big)
-\]
+### 调度与执行分离
 
-注意：
+调度器决定“谁可以运行”；执行器负责真正执行 CUDA、TensorRT 或模型计算。
 
-\[
-\max(0,p(x)-q(x))
-=
-p(x)-\min(p(x),q(x))
-\]
+### 计算预算与缓存预算共同约束
 
-因此：
+有算力但没有缓存，任务不能运行；有缓存但执行队列已满，同样不能运行。
 
-\[
-p'(x)
-=
-\frac{p(x)-\min(p(x),q(x))}
-{\sum_y[p(y)-\min(p(y),q(y))]}
-\]
+### 资源由最后一个消费者释放
 
-分母为：
+共享资源不能由第一个完成的任务释放，而必须等待最后一个引用者结束。
 
-\[
-\begin{aligned}
-\sum_y[p(y)-\min(p(y),q(y))]
-&=\sum_y p(y)-\sum_y\min(p(y),q(y))\\
-&=1-\beta
-\end{aligned}
-\]
+### 有界队列与背压
 
-所以：
+生产速度超过消费速度时，必须暂停生产或优先 drain，不能依赖无界队列吸收压力。
 
-\[
-p'(x)=
-\frac{p(x)-\min(p(x),q(x))}
-{1-\beta}
-\]
+### 完成反馈驱动下一轮调度
 
-### 3. 固定一个 token \(x_0\)
+异步任务的 completion 不只是结果通知，也是资源回收和新任务准入的触发器。
 
-要证明最终结果服从 \(p\)，只需证明最终输出 \(x_0\) 的概率恰好为 \(p(x_0)\)。
+---
 
-\(x_0\) 可以通过两条互斥路径输出：
+## 三、映射到 CFM 后发生的变化
 
-\[
-P(x=x_0)
-=
-P(\text{接受候选且输出 }x_0)
-+
-P(\text{拒绝候选后修正为 }x_0)
-\]
+vLLM 的基本思想可以迁移到 CFM，但调度对象和依赖关系发生了变化。
 
-### 4. 路径一：接受小模型候选
+| vLLM | CFM |
+|---|---|
+| Request | Pair 匹配任务 |
+| Prefill | View 特征提取 |
+| KV Cache | View feature cache |
+| KV block | Feature slab |
+| Continuous batching | Ready pair 动态组批 |
+| KV Cache Manager | Frontier cache manager |
+| Request completion | Pair completion |
+| Block release | View 引用归零后回收 slab |
 
-小模型提出 \(x_0\) 的概率是 \(q(x_0)\)，接受概率是：
+### 1. Pair 是请求，view feature 是共享状态
 
-\[
-\min\left(1,\frac{p(x_0)}{q(x_0)}\right)
-\]
+CFM 中真正需要执行的是 pair：
 
-因此：
+```text
+Pair(A, B)
+```
 
-\[
-\begin{aligned}
-P(\text{接受且输出 }x_0)
-&=q(x_0)\min\left(1,\frac{p(x_0)}{q(x_0)}\right)\\
-&=\min(q(x_0),p(x_0))
-\end{aligned}
-\]
+但它只有在两个端点的 feature 均已驻留时才可以运行：
 
-这部分对应 \(p\) 和 \(q\) 的重合概率。
+```text
+Ready(A, B)
+= Resident(A)
+&& Resident(B)
+```
 
-### 5. 路径二：拒绝后修正
+因此，pair 类似 vLLM request；view feature 类似执行请求所需的缓存状态。
 
-发生拒绝的概率是 \(1-\beta\)。拒绝后，从 \(p'\) 中采到 \(x_0\) 的概率是 \(p'(x_0)\)。
+### 2. CFM 的共享关系更强
 
-所以：
+普通 LLM 请求通常主要消费自己的 KV Cache。即使存在 prefix caching，共享关系也相对结构化。
 
-\[
-\begin{aligned}
-P(\text{拒绝后输出 }x_0)
-&=(1-\beta)p'(x_0)\\
-&=(1-\beta)
-\frac{p(x_0)-\min(p(x_0),q(x_0))}
-{1-\beta}\\
-&=p(x_0)-\min(p(x_0),q(x_0))
-\end{aligned}
-\]
+CFM 中，一个 view 可能被大量 pair 同时引用：
 
-这部分正好补上小模型相对于目标模型缺少的概率。
+```text
+(A,B)
+(A,C)
+(A,D)
+(A,E)
+```
 
-### 6. 两条路径相加
+Feature(A) 必须一直保留到这四个 pair 全部完成。它的释放时间由共视图中的最后一个消费者决定。
 
-\[
-\begin{aligned}
-P(x=x_0)
-&=\min(p(x_0),q(x_0))\\
-&\quad+p(x_0)-\min(p(x_0),q(x_0))\\
-&=p(x_0)
-\end{aligned}
-\]
+因此，CFM 本质上是：
 
-由于这个结论对任意 \(x_0\) 都成立，所以：
+> 带图依赖和共享缓存的 continuous batching。
 
-\[
-\boxed{x\sim p(x)}
-\]
+### 3. CFM 多了一层离线拓扑规划
 
-这就证明了 Speculative Sampling 与直接从目标模型 \(p\) 采样具有完全相同的输出分布。
+vLLM 的主要调度决策通常发生在请求运行期间。CFM 的全部 pair 通常预先已知，因此可以先分析共视图，再决定 view 的生产顺序。
 
-直观地看：
+不同的 view 顺序会产生不同的活跃前沿：
 
-\[
-\underbrace{\min(p,q)}_{\text{小模型负责的重合部分}}
-+
-\underbrace{p-\min(p,q)}_{\text{拒绝后的补偿部分}}
-=p
-\]
+- 如果一个 view 很早被提取，但它的最后一个邻居很晚才出现，它会长期占用缓存；
+- 如果相关 view 被集中安排，其关联 pair 可以更早完成，feature 也能更早释放。
 
-小模型只负责两个分布重合的部分；目标模型通过修正分布补齐其余部分，因此既能利用小模型加速，又不会改变目标分布。若 \(p=q\)，则 \(\beta=1\)，候选永远被接受，修正分布根本不会被使用。来源：:codex-file-citation{path="/home/hesai/推测解码/output/papers/01_Fast_Inference_from_Transformers_via_Speculative_Decoding.pdf" purpose="source"}
+因此，CFM 形成了两层策略：
 
-- :codex-followup[用图形解释证明]{prompt="请用概率面积图直观展示附录A.1中 p、q、min(p,q) 和修正分布的关系"}
-- :codex-followup[证明多token正确性]{prompt="请进一步说明单token证明如何扩展到多token speculative decoding"}
-- :codex-followup[解释接受率公式]{prompt="请解释接受率 beta 与 p、q 的总变差距离之间的关系"}
+```text
+离线 Planner：优化未来缓存生命周期
+在线 Scheduler：根据真实完成状态控制执行
+```
+
+### 4. CFM 通常不接受重计算式抢占
+
+vLLM 在资源不足时，可以根据策略抢占请求、交换状态或重新计算 KV。
+
+当前 CFM Frontier 的关键合同则是：
+
+```text
+每个 view 只提取一次
+不做 descriptor spill
+不通过重提取恢复资源
+```
+
+资源不足时采用背压和 drain；如果仍无法满足安全约束，则 fail-closed。
+
+---
+
+## 四、CFM 的逻辑实现
+
+CFM 调度可以分为规划、生产、匹配、完成和回收五个环节。
+
+### 1. 构建共视图并规划顺序
+
+输入 pair 列表形成图：
+
+```text
+view = vertex
+pair = edge
+```
+
+Planner 生成多个候选 view 顺序：
+
+- `bfs_v1`：按连通性逐步扩展；
+- `rcm_v2`：降低图的有效带宽；
+- `min_frontier_v2`：优先关闭当前活跃前沿。
+
+对每个候选顺序进行生命周期模拟：
+
+```text
+按顺序产生 view
+→ 找出刚刚 ready 的 edges
+→ 模拟这些 edges 完成
+→ 统计仍需驻留的 views/slabs
+→ 计算峰值占用
+```
+
+候选首先必须满足：
+
+```text
+pair coverage = 1
+missing pair = 0
+duplicate pair = 0
+peak slab slots < high watermark
+```
+
+然后选择合法且驻留峰值较低的方案。若 BFS 已经低于低水位，可以直接采用，避免为了很小的收益引入更复杂的顺序。
+
+### 2. 分配物理 Feature Cache
+
+规划阶段生成 logical slabs，运行时使用固定数量的 physical slabs：
+
+```text
+logical slab
+→ free-list 分配 physical slab
+→ 写入 GPU feature cache
+```
+
+每次物理 slab 被重新分配时，generation 递增：
+
+```text
+physical_slot = 10
+generation = 7
+```
+
+异步 Matcher 任务必须同时记录 slot 和 generation，防止 slot 被复用后旧任务读取错误数据。
+
+### 3. View 特征生产
+
+Host 侧使用有界持久 worker 预取图像和准备输入。GPU 侧通过 CUDA event 串联：
+
+```text
+Host prepare
+→ Decode/Preprocess
+→ DaD
+→ DeDoDe
+→ feature-ready event
+```
+
+生产完成后，不需要等待全部 view，而是立即检查哪些 pair 的两个端点均已 resident。
+
+### 4. Ready pair 动态组批
+
+新就绪的 pair 进入 ready queue。调度器按照预算动态形成 Matcher batch：
+
+```text
+首次累计到 trigger_pairs 后启动
+→ 每次最多取 batch_pairs
+→ in-flight batches 不超过上限
+```
+
+典型配置为：
+
+```text
+trigger_pairs = 64
+batch_pairs = 4
+max_inflight_batches = 16
+```
+
+这与 vLLM 的 continuous batching 相同：批次是随系统状态动态形成的，而不是预先固定的静态分组。
+
+### 5. 完成、引用递减和回收
+
+Matcher completion 到达后：
+
+```text
+校验 pair 的 slot 和 generation
+→ 标记 pair 完成
+→ endpoint A remaining_edges--
+→ endpoint B remaining_edges--
+```
+
+当一个 slab 内所有 view 的 `remaining_edges` 都变为零时：
+
+```text
+删除 view → slot 映射
+→ physical slab 返回 free-list
+→ 唤醒等待分配缓存的生产者
+```
+
+这里必须使用真正的 completion，而不是“任务已经提交”。因为提交后 Matcher 仍可能在异步读取 feature。
+
+### 6. 高低水位背压
+
+生产者和消费者的速度可能不一致：
+
+```text
+Feature 生产快
+Matcher 消费慢
+→ resident 持续增长
+```
+
+CFM 使用高低水位形成迟滞：
+
+```text
+allocated >= high
+→ 暂停新的 feature 生产
+→ 优先提交并 drain ready pairs
+→ 回收 slabs
+→ allocated <= low
+→ 恢复生产
+```
+
+典型合同为：
+
+```text
+capacity = 1280
+high = 1152
+low = 896
+```
+
+绝对容量用于安全保护，高低水位用于稳定控制。
+
+### 调度主循环
+
+整体逻辑可以抽象为：
+
+```cpp
+while (!all_pairs_finished) {
+    collect_completed_pairs();
+    decrement_view_references();
+    reclaim_finished_slabs();
+
+    discover_new_ready_pairs();
+
+    while (matcher_budget_available() &&
+           ready_batch_available()) {
+        submit_matcher_batch();
+    }
+
+    if (resident_slots >= high_watermark) {
+        drain_until(low_watermark);
+        continue;
+    }
+
+    if (free_slab_available()) {
+        extract_next_view_slab();
+    } else {
+        wait_for_completion_or_watchdog();
+    }
+}
+```
+
+---
+
+## 五、对应真实类和关键状态
+
+### `PairResidentScheduler`
+
+位置：
+
+```text
+src/third_party/loma_trt_runtime/src/pair_resident_scheduler.cpp
+```
+
+主要职责是离线规划：
+
+```text
+构建 pair graph
+→ 生成 BFS/RCM/Min-Frontier 候选
+→ 模拟 resident/slab 峰值
+→ 校验 pair coverage
+→ 生成确定性 schedule SHA
+```
+
+核心产物是 `StreamingPairSchedule`，其中包含：
+
+- `view_order`；
+- `views`；
+- `slabs`；
+- `pairs_by_original_index`；
+- `ready_edge_ids_by_slab`；
+- `peak_live_views`；
+- `peak_slab_slots`；
+- `schedule_sha256`。
+
+### `FrontierCacheState`
+
+位于：
+
+```text
+src/third_party/loma_trt_runtime/src/openmvg_loma_match.cpp
+```
+
+它相当于 CFM 的 KV Cache Manager，维护：
+
+```text
+logical_to_physical
+free_physical_slabs
+view_slot
+view_generation
+remaining_edges
+edge_completed
+allocated_slots
+```
+
+关键操作包括：
+
+- `acquireSlab()`：分配物理 slab；
+- `materializeEdge()`：把逻辑 pair 固化为 slot 与 generation；
+- `complete()`：处理 Matcher completion；
+- `shouldBackpressure()`：判断是否触发背压。
+
+### `AsyncMatchCollector`
+
+负责 Matcher 的异步执行与结果槽管理：
+
+```text
+提交 batch
+→ 记录 CUDA completion event
+→ 异步 D2H
+→ 回调 FrontierCacheState
+→ 释放 output ring slot
+```
+
+它同时限制 Matcher in-flight 数量，防止执行和输出缓存无界增长。
+
+### `PersistentTaskWorker`
+
+负责 Host 侧有界预取：
+
+```text
+固定 worker 数
++ 固定 queue depth
++ 持久线程复用
+```
+
+它解决的是 Store、NAS 或 CPU 准备速度波动，而不是增加 GPU stream。
+
+### 关键状态机
+
+Pair：
+
+```text
+Waiting
+→ Ready
+→ InFlight
+→ Completed
+```
+
+View：
+
+```text
+Unscheduled
+→ Extracting
+→ Resident
+→ NoRemainingEdges
+→ Released
+```
+
+Slab：
+
+```text
+Free
+→ Allocated
+→ Referenced
+→ Reclaimable
+→ Free
+```
+
+这些状态共同构成 CFM 调度器的真实运行状态。
+
+---
+
+## 六、正确性、性能与失败边界
+
+### 1. 正确性边界
+
+调度优化只能改变执行顺序，不能改变业务语义。必须保持：
+
+```text
+每个 view 只提取一次
+每个原始 pair 只执行一次
+pair 方向不变
+pair coverage = 100%
+missing = 0
+duplicate = 0
+结果按 original_index 恢复
+```
+
+缓存生命周期必须满足：
+
+```text
+pair dispatch 时两个 endpoint 都 resident
+pair completion 前 slab 不得回收
+slot generation 必须一致
+remaining_edges 不得下溢
+```
+
+这些属于不可妥协的安全不变量。
+
+### 2. 性能边界
+
+调度器希望同时优化：
+
+- Feature 与 Matcher 的重叠；
+- GPU feature cache 峰值；
+- Matcher batch 填充率；
+- ready queue 稳定性；
+- Host 预取等待；
+- backpressure 时间；
+- 最终 drain tail。
+
+但这些目标可能冲突。
+
+例如：
+
+- 更早启动 Matcher 可以降低 resident，却可能产生较多小 batch；
+- 更大 trigger 可以提高 batch 效率，却延迟首次匹配；
+- 更高并发可以增加重叠，也可能让 Feature 与 Matcher 争抢 GPU 算力；
+- 更大的预取深度可以缓解 I/O 抖动，也会增加 Host RSS。
+
+所以，调度器并非单纯追求最大并发，而是追求生产速率、消费速率和资源占用之间的稳定平衡。
+
+### 3. 失败边界
+
+当前策略强调 fail-closed。主要失败包括：
+
+- `SCHEDULE_NOT_FOUND_UNDER_CAP`：没有候选顺序满足缓存上限；
+- `RUNTIME_FRONTIER_STALL`：达到水位后长期没有 slab 可回收；
+- `RUNTIME_VRAM_GATE_FAIL`：运行时显存越过硬门限；
+- generation mismatch：异步任务引用了已被复用的 slot；
+- duplicate completion：同一 pair 被重复完成；
+- refcount underflow：资源生命周期计数错误；
+- Matcher 初始化或提交失败；
+- 配置合同不合法。
+
+这些失败不能通过以下方式静默掩盖：
+
+```text
+删除 pair
+重复提取 view
+偷偷使用 Host spill
+切换 full-resident
+回退到另一条 pipeline
+```
+
+因为这会改变性能、内存或结果语义，使调度行为失去可验证性。
+
+---
+
+## 总结
+
+以 vLLM 视角看，CFM Frontier 不是一个简单的 pair 排序算法，而是一套完整的 Serving 调度系统：
+
+```text
+Pair 是请求
+View feature 是共享缓存状态
+Slab 是物理缓存块
+Pair-ready 是 admission 条件
+Matcher batch 是 continuous batching
+Completion 是资源回收信号
+High/Low watermark 是背压机制
+Generation 是异步缓存安全协议
+```
+
+它比普通 LLM Serving 多了一个关键维度：共视图拓扑决定共享缓存的生命周期。
+
+因此，CFM 调度最核心的思想是：
+
+> 先利用图结构规划资源何时产生，再根据真实完成事件决定资源何时释放；在固定显存预算下，让生产、消费和回收持续形成闭环。
