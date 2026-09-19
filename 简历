@@ -1,0 +1,14 @@
+## OpenMVG 长序列 CFM 异构调度与显存优化｜核心开发 / 调度策略设计  
+**2026.07–2026.08｜C++17、CUDA、TensorRT、OpenMVG、Python、NVML、Nsight Systems**
+
+面向大规模图像序列的特征提取与匹配任务，解决全量 Feature Cache 导致的显存线性增长、特征提取与匹配阶段阻塞及长序列显存溢出问题。
+
+- 借鉴 Continuous Batching 与固定容量缓存思想，将 CFM 抽象为由 Pair 请求、共享 View 特征和 Feature Slab 组成的有界异步调度系统，实现调度决策、缓存生命周期与 GPU 执行解耦。
+- 基于共视图构建 Pair Graph，设计 BFS、RCM、Min-Frontier 多候选离线规划，通过模拟 View 生命周期与活跃前沿选择最低峰值驻留顺序；实现 Pair-Ready 动态组批，按 Trigger、Batch Size 和 In-flight Budget 异步调度 Matcher，消除全局阶段屏障。
+- 基于 CUDA Event 构建 Decode/Preprocess、Detector/Descriptor 与 Matcher 的设备侧依赖，结合双流 Phase1、Persistent Host Prefetch Worker 和异步结果环，实现图像准备、特征提取、匹配及结果回收的流水化重叠。
+- 设计固定容量 Feature Slab，通过 Edge Refcount 判断最后消费者、Slot Generation 校验异步缓存代次，并在 Matcher Completion 后安全回收槽位；构建 Host Queue、GPU Resident Set 高低水位及 Matcher In-flight Ring 三级资源控制。
+- 完善 NVML 显存监控、Watchdog 与模型/输入 SHA 身份校验，对显存越界、调度停滞、缓存代次冲突及 Pair 异常采用 Fail-Closed，确保 Pair Coverage 100%、Missing/Duplicate 为 0/0、View 重提取为 0、Descriptor Spill 为 0 Byte。
+- 在 1,746 Views、33,926 Pairs 的受控 A/B 测试中，将 CFM 耗时由 264.50 s 降至 147.51 s，降低 44.2%，实现 1.79× 加速；基线与优化组三次冷启动 CV 分别为 0.066% 和 0.44%。
+- 在 10,589 Views、203,509 Pairs 的 50 分钟长序列上，将进程峰值显存由 32.82 GiB 降至 14.51 GiB，下降 55.8%，满足 20 GiB 软件预算；CFM 耗时由 1,075.52 s 降至 838.12 s，降低 22.1%，实现 1.28× 加速。
+- Feature/Matcher 重叠时长达 811.78 s，占 CFM 总耗时 96.86%，覆盖 Matcher 有效执行区间 99.9997%；Matcher 吞吐达 250.69 pairs/s，Backpressure 占比低于 0.000001%，Drain Tail 占比仅 0.00030%。
+- 优化配置五次冷启动 CFM 中位耗时为 834.81 s，CV 为 0.185%，验证长序列调度的性能稳定性与结果确定性。
