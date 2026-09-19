@@ -24,3 +24,17 @@ C++17 · CUDA · TensorRT · OpenMVG · Python · NVML · Nsight Systems
 - 设计固定容量 Feature Slab，通过 Edge Refcount、Slot Generation 和 Completion 回调管理缓存生命周期；结合 CUDA Event 流水线、高低水位背压及有界 In-flight Ring，实现特征提取、匹配和缓存回收的异步重叠。
 - 建立 NVML 显存门禁、Watchdog 与 Fail-Closed 机制，保证 Pair Coverage 100%、Missing/Duplicate 为 0/0，且无 View 重提取和 Descriptor Spill。
 - 在 10,589 Views、203,509 Pairs 的 50 分钟长序列上，将峰值显存从 **32.82 GiB 降至 14.51 GiB（-55.8%）**，CFM 耗时从 **1,075.52 s 降至 838.12 s（-22.1%，1.28×）**；受控 A/B 场景实现 **1.79× 加速**，五次冷启动 CV 仅 **0.185%**。
+
+
+
+## LoMa 视觉匹配 FP16 推理引擎与算子优化
+
+**核心开发 / 推理性能优化｜2026.07–2026.08**\
+C++17 · CUDA · TensorRT · CUTLASS · FlashAttention · Nsight Systems
+
+针对 LoMa 检测、描述与 Transformer Matcher 在生产部署中存在算子碎片化、数据搬运频繁及 GPU 利用率不足的问题，构建以 FP16 为核心的端到端推理链路，在保持匹配精度的前提下降低延迟并提升吞吐。
+
+- 将 Detector、Descriptor 与 Matcher 导出为 FP16 TensorRT Engine，统一模型输入输出、动态 Shape、Engine Cache 与版本校验机制；保持中间特征驻留 GPU，减少框架切换、Host 同步及冗余 H2D/D2H。
+- 针对 Matcher 的 Self/Cross Attention 和 FFN 热点，实施 A/B Batch 合并、Paired GEMM、QKV/RoPE、LayerNorm/GELU、Residual 及匹配过滤融合，并通过 CUDA Graph 降低固定 Shape 推理中的 Kernel Launch 开销。
+- 设计 Assignment Token Pruning 与融合 Top-K 算子，根据双向匹配置信度动态筛选关键 Token，压缩后续 Transformer 的 Attention 计算量，并将局部匹配结果映射回原始关键点空间。
+- 建立 Tensor、Match、Pose AUC 与端到端耗时四级精度门禁；面向 LLM 推理场景探索 E4M3 FP8 技术路线，基于 FlashAttention v2 与 CUTLASS 实现 FP8 Attention/GEMM，结合静态 PTQ、FP32 在线 Softmax及跨层连续 FP8 数据流，减少量化转换与 Kernel Launch 开销。
