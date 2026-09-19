@@ -1,13 +1,405 @@
-```mermaid
-flowchart LR
-  X[输入状态] --> QKV[QKV Linear]
-  QKV --> F1[融合：拆分 QKV + RoPE + Flash 布局]
-  F1 --> ATTN[FlashAttention]
-  ATTN --> OP[输出 Linear]
-  X --> CAT[融合：A/B FP32 state + BF16 message 拼接]
-  OP --> CAT
-  CAT --> L0[FFN Linear0]
-  L0 --> F2[融合：LayerNorm + affine + GELU + BF16 cast]
-  F2 --> L3[FFN Linear3]
-  L3 --> F3[融合：FP32 residual + BF16 projection]
+GaussianGPT 的 Introduction 可以整理成一条典型的论文论证链：
+
+> 3D 场景需要增量构建 → 现有方法主要做全局生成 → 不适合自然地补全和扩展 → 将场景变成离散序列 → 用 GPT 逐步生成。
+
+## 1. 背景是什么？
+
+深度生成模型已经能高质量生成：
+
+- 图像；
+- 视频；
+- 音频；
+- 文本；
+- 单个 3D 物体。
+
+下一步目标是生成完整、结构化的 3D 场景，用于：
+
+- 虚拟现实和游戏内容创作；
+- 具身智能；
+- 机器人仿真；
+- 室内环境设计。
+
+完整场景生成比单个物体更复杂，因为模型必须同时处理：
+
+- 房间整体布局；
+- 多个物体的组合关系；
+- 几何结构和外观；
+- 长距离空间依赖；
+- 多视角一致性；
+- 物体摆放的合理性。
+
+作者还强调，实际场景通常不是一次构造完成的，而是不断被：
+
+- 添加；
+- 补全；
+- 编辑；
+- 向外扩展。
+
+因此，理想的场景模型应支持增量式生成。
+
+---
+
+## 2. 核心问题是什么？
+
+作者关注的问题是：
+
+> 如何使用一个统一生成模型，逐步生成具有几何和外观的完整 3D 场景，并自然支持场景补全和空间扩展？
+
+这个大问题还包含三个技术困难。
+
+### 问题一：3D 场景维度很高
+
+场景包含大量几何和外观参数。如果直接生成所有 Gaussian primitives，序列会非常长，计算成本也非常高。
+
+### 问题二：3D Gaussian 是无序集合
+
+一个场景由大量 Gaussian primitives 组成，但这些 Gaussian 没有天然顺序：
+
+\[
+\mathcal G=\{g_1,g_2,\ldots,g_N\}
+\]
+
+同一个场景可以用很多不同排列表示。这使 GPT 式 next-token prediction 无法直接应用。
+
+### 问题三：3D 空间没有天然的一维序列
+
+即使人为地把三维场景排列成一维序列，也可能出现：
+
+- 空间相邻、序列上相距很远；
+- 序列相邻、空间上并不相邻。
+
+普通 1D positional encoding 无法可靠表达真实的三维关系。
+
+---
+
+## 3. 现有解决方案是什么？
+
+Introduction 主要总结了几类方法。
+
+### 3.1 Diffusion 和 Flow Matching
+
+当前主流 3D 生成方法使用：
+
+- diffusion；
+- flow matching；
+- neural fields；
+- Gaussian primitives；
+- latent scene representation。
+
+这些方法从完整噪声表示开始，反复更新整个场景：
+
+\[
+X_T\rightarrow X_{T-1}\rightarrow\cdots\rightarrow X_0
+\]
+
+它们可以获得很好的视觉质量，是当前最主要的技术路线。
+
+### 3.2 场景布局加对象生成
+
+另一类方法先预测：
+
+- 房间布局；
+- 物体类别；
+- bounding box；
+- 物体位置。
+
+然后进行对象检索或逐对象生成。
+
+### 3.3 借助预训练二维生成模型
+
+部分方法利用强大的：
+
+- image diffusion；
+- video diffusion；
+-视觉基础模型；
+- 大语言模型。
+
+先生成二维视图、全景图或布局，再优化或重建成三维场景。
+
+### 3.4 Feed-forward 3D 重建
+
+还有一些方法根据单张、多张图像或深度信息，直接预测 3D Gaussians。
+
+但这类方法主要解决的是“根据观测重建已有场景”，而不是从学习到的分布中无条件生成新场景。
+
+---
+
+## 4. 当前解决方案有什么问题？
+
+### 4.1 Diffusion/Flow 是整体式生成
+
+扩散和流匹配通常在每一步更新完整空间表示：
+
+```text
+完整噪声场景
+  ↓ 全局更新
+完整中间场景
+  ↓ 全局更新
+完整最终场景
 ```
+
+这种机制适合全局生成，但不完全符合场景的增量构造方式。
+
+如果已经有半个房间，只想继续生成剩余部分，扩散模型通常仍需要处理完整表示。
+
+### 4.2 补全需要额外机制
+
+扩散模型可以做补全，但往往需要：
+
+- mask；
+-条件网络；
+- inpainting；
+- RePaint；
+- 特殊噪声调度。
+
+也就是说，无条件生成和场景补全不一定天然属于同一个推理过程。
+
+### 4.3 不容易灵活改变场景大小
+
+很多方法的生成范围由固定张量或空间网格决定。想要生成超过训练范围的大场景，通常需要额外的拼接、优化或专门扩展机制。
+
+### 4.4 多阶段方法依赖外部先验
+
+依赖二维扩散模型、视频模型或对象库的方法可能存在：
+
+- 多阶段误差传播；
+- 几何与二维图像不一致；
+- 需要额外模型和优化；
+- 系统复杂；
+- 无法直接学习统一的 3D 场景分布。
+
+### 4.5 自回归模型难以直接处理 3D Gaussian
+
+虽然 GPT 在语言、图像和多模态生成中已经很成功，但 3D Gaussian 存在：
+
+- 连续属性；
+- 数量多；
+- 集合无序；
+- 缺乏规范排列；
+- 序列长度过长。
+
+所以不能直接把原始 Gaussian 当成普通文本 token。
+
+---
+
+## 5. 作者提出了什么解决方案？
+
+作者提出 **GaussianGPT**，把完整 3D 场景生成转化为 decoder-only Transformer 的 next-token prediction。
+
+总体流程是：
+
+```text
+3D Gaussian 场景
+  ↓ 规则空间网格化
+Sparse 3D Feature Grid
+  ↓ Sparse 3D CNN 压缩
+连续 Latent Grid
+  ↓ LFQ 量化
+离散 Latent Grid
+  ↓ xyz 序列化
+Position–Feature Token 序列
+  ↓ Causal Transformer
+生成新的 Token 序列
+  ↓ Sparse 3D CNN Decoder
+3D Gaussian 场景
+```
+
+主要由四个机制组成。
+
+### 5.1 将 Gaussian 投影到稀疏三维网格
+
+作者先根据位置将 Gaussian 分配到 voxel，使无序集合变成规则的空间表示。
+
+每个 voxel 中编码：
+
+- 位置 offset；
+- 颜色；
+- opacity；
+- scale；
+- rotation；
+- 其他外观特征。
+
+### 5.2 压缩并离散化场景
+
+使用 Sparse 3D CNN autoencoder 将高分辨率 Gaussian grid 压缩成低分辨率 latent grid。
+
+随后使用 LFQ 将连续 latent 转化为离散 code：
+
+\[
+f_i\in\{0,\ldots,4095\}
+\]
+
+这样就得到了 GPT 可以预测的离散 token。
+
+### 5.3 交替生成位置和特征
+
+每个 occupied latent voxel 表示为：
+
+\[
+(p_i,f_i)
+\]
+
+其中：
+
+- \(p_i\)：下一个占用 voxel 的位置；
+- \(f_i\)：该位置的离散 latent feature。
+
+序列为：
+
+\[
+[\mathrm{BOS},p_0,f_0,p_1,f_1,\ldots,\mathrm{EOS}]
+\]
+
+模型交替预测：
+
+\[
+p_i\rightarrow f_i\rightarrow p_{i+1}\rightarrow f_{i+1}
+\]
+
+### 5.4 使用 3D RoPE
+
+模型不只依赖 token 的一维序号，而是将真实三维坐标编码进 attention：
+
+\[
+(x_i,y_i,z_i,\text{token type})
+\]
+
+这样，即使空间相邻的 voxel 在序列中相距很远，模型仍能通过三维坐标识别其空间关系。
+
+---
+
+## 6. 为什么这个方案能够解决问题？
+
+### 6.1 网格化解决无序问题
+
+原始 Gaussian 集合没有固定顺序。映射到 voxel grid 后，每个空间位置拥有明确坐标，再使用固定 xyz 顺序遍历，就能得到确定序列：
+
+\[
+\text{unordered Gaussians}
+\rightarrow
+\text{structured grid}
+\rightarrow
+\text{ordered sequence}
+\]
+
+因此可以应用 causal Transformer。
+
+### 6.2 压缩量化解决高维与连续性问题
+
+GPT 不能高效地逐个预测大量连续 Gaussian 参数。
+
+Sparse 3D CNN 将局部 Gaussian 信息压缩为 latent，LFQ 再将其转化为离散类别：
+
+\[
+\text{大量连续属性}
+\rightarrow
+\text{少量离散 code}
+\]
+
+这大幅缩短了生成序列，并将问题变成标准分类式 next-token prediction。
+
+### 6.3 位置—特征分离使几何与外观更清晰
+
+position head 学习：
+
+> 场景中哪里存在内容？
+
+feature head 学习：
+
+> 该位置应该包含什么内容？
+
+这相当于将生成分解为：
+
+\[
+P(S)=
+\prod_i
+P(p_i\mid \text{history})
+P(f_i\mid p_i,\text{history})
+\]
+
+从而显式分离空间结构与局部特征建模。
+
+### 6.4 3D RoPE 恢复空间关系
+
+序列化会破坏三维局部性，而 3D RoPE 让注意力依赖真实空间偏移：
+
+\[
+(\Delta x,\Delta y,\Delta z)
+\]
+
+因此模型不必仅依赖序列距离理解空间结构。
+
+论文消融也表明，3D RoPE 优于普通 1D RoPE 和 learned positional embedding。
+
+### 6.5 Prefix conditioning 自然解决补全
+
+对于局部已知场景，先将它编码为 token 前缀：
+
+\[
+t_{1:k}
+\]
+
+再预测：
+
+\[
+P(t_{k+1:T}\mid t_{1:k})
+\]
+
+因此：
+
+- 无前缀：无条件生成；
+- 部分场景前缀：场景补全；
+- 已生成区域作为前缀：继续扩展。
+
+模型结构和训练目标都不需要变化。
+
+### 6.6 滑动窗口支持大场景扩展
+
+模型只需要生成固定大小的局部 chunk。完成一个区域后，把窗口移向新区域，并使用之前生成的局部内容作为上下文：
+
+```text
+已有空间区域
+    ↓ 作为 prefix
+生成相邻空间列
+    ↓
+移动窗口
+    ↓
+继续生成
+```
+
+这使生成范围不必在开始时固定。
+
+---
+
+## 7. Introduction 的完整论证链
+
+可以压缩成下面这条逻辑：
+
+```text
+背景：
+完整3D场景生成对虚拟环境、具身智能和仿真很重要
+          ↓
+现实观察：
+场景通常被逐步添加、补全和扩展
+          ↓
+问题：
+当前3D生成主要采用整体式Diffusion/Flow
+          ↓
+不足：
+局部补全、增量编辑和开放式扩展不够自然
+          ↓
+技术障碍：
+3D Gaussian连续、无序、高维且没有天然序列
+          ↓
+解决方案：
+稀疏网格化 + 3D CNN压缩 + LFQ离散化
++ position-feature序列 + 3D RoPE + causal GPT
+          ↓
+为什么有效：
+将场景转化为可续写的离散空间语言
+          ↓
+获得能力：
+统一实现无条件生成、补全和大场景outpainting
+```
+
+需要注意的是，作者证明的是自回归范式在这些任务上更自然，并没有证明它全面优于扩散模型。它仍有串行解码慢、长距离误差累积和几何多样性较弱等问题。论文依据：:codex-file-citation{path="/home/hesai/推测解码/2603.26661v2.pdf" purpose="source"}。
