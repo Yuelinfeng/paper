@@ -29,7 +29,7 @@ C++17 · CUDA · TensorRT · OpenMVG · Python · NVML · Nsight Systems
 
 ## LoMa Matcher FP16 推理与算子优化
 
-**核心开发 / 推理性能优化｜2026.07–2026.08**\
+**核心开发 / 推理性能优化｜2026.07–2026.08**  
 C++17 · CUDA · TensorRT · CUTLASS · FlashAttention · Nsight Systems
 
 针对 2048-Token Transformer Matcher 中 Attention 计算量大、算子碎片化及 Kernel Launch 密集等问题，构建 FP16 TensorRT 推理链路，并围绕计算缩减、算子融合与执行调度开展系统优化。
@@ -37,6 +37,6 @@ C++17 · CUDA · TensorRT · CUTLASS · FlashAttention · Nsight Systems
 - 完成 Matcher FP16 TensorRT 部署，统一固定 Shape、执行缓冲区复用与 Engine 版本管理，使匹配计算全程驻留 GPU，减少 Host 同步及冗余 H2D/D2H。
 - 聚焦 Self/Cross Attention 与 FFN 核心热点，通过双路 Batch 合并、Paired GEMM 和关键算子融合提升执行效率，并利用 CUDA Graph 降低算子碎片化与启动开销。
 - 设计基于双向 Assignment 置信度的动态 Token Pruning，融合 Top-K 筛选与索引回映射，将后续 Transformer 序列由 2048 压缩至 1024/512，在保持原始输出语义的同时降低 Attention 计算复杂度。
-- 建立 Tensor 误差、Match 一致性、Pose AUC 与端到端耗时四级门禁；单 Pair Matcher 延迟约 **2.0 ms**，长序列批处理完成 **33,926 Pairs / 62.69 s**，稳态吞吐达到 **541 Pairs/s**（摊销约 **1.85 ms/Pair**）；固定回归集 Match 输出一致率 **100%**，Pose AUC 变化控制在 **1 个百分点以内**。
+- 建立 Tensor 误差、Match 一致性、Pose AUC 与端到端耗时四级门禁；单 Pair 推理延迟约 **2.0 ms**，长序列批处理 **33,926 个 Pair 总耗时 62.69 s**，稳态吞吐达到 **541 Pairs/s**（摊销约 **1.85 ms/Pair**）；固定回归集 Match 输出一致率 **100%**，Pose AUC 变化控制在 **1 个百分点以内**。
 
-**技术探索：** 借鉴 LLM 低精度推理技术，基于 FlashAttention v2 与 CUTLASS 探索 E4M3 FP8 Attention/GEMM，设计静态 PTQ、FP32 在线 Softmax与跨层连续 FP8 数据流，减少量化转换及 Kernel Launch 开销。
+**技术探索：** 借鉴 LLM 低精度推理技术，基于 FlashAttention v2 与 CUTLASS 探索 E4M3 FP8 Attention/GEMM，设计静态 PTQ、FP32 在线 Softmax 与跨层连续 FP8 数据流，减少量化转换及 Kernel Launch 开销。
