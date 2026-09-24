@@ -403,3 +403,11 @@ P(t_{k+1:T}\mid t_{1:k})
 ```
 
 需要注意的是，作者证明的是自回归范式在这些任务上更自然，并没有证明它全面优于扩散模型。它仍有串行解码慢、长距离误差累积和几何多样性较弱等问题。论文依据：:codex-file-citation{path="/home/hesai/推测解码/2603.26661v2.pdf" purpose="source"}。
+
+**项目背景：** 面向 NAFNet 6 通道图像增强模型的训练数据管理需求，建设 AI ISP 数据资产平台，对存储在 NAS 中的三视角 LQ–GT 图像进行自动发现、配对入库、质量分析、语义标注与全链路追溯，为训练集筛选、缺口分析和模型迭代提供可靠数据基础。
+
+**技术栈：** Python、FastAPI、SQLite、NumPy、OpenCV、Pydantic、HTML/CSS/JavaScript、Qwen3.8-27B、vLLM、RESTful API、JSON Schema、NAS。
+
+- 搭建 AI ISP 三视角 LQ–GT 数据工程链路，完成 NAS 数据自动发现、跨目录配对、Metadata 解析、只读预检与幂等入库，支持缺失/歧义数据识别及资产状态同步。
+- 设计可追溯的数据治理体系，通过可信 Manifest、版本化规则、不可变 Observation、文件 Hash 与审计日志，保障 GT 来源、处理过程和分析结果可回放、可审计。
+- 构建数据质量与特征分析管线，自动计算 LQ–GT 配准、噪声、清晰度、曝光等指标，并融合 VLM 生成 16 类场景与 51 类语义标签，实现数据检索、覆盖率统计及训练集缺口分析。
